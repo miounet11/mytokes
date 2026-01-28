@@ -1,0 +1,77 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ai-history-manager"
+version = "0.1.0"
+description = "AI conversation history manager with smart truncation and summarization"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.9"
+authors = [
+    { name = "Your Name", email = "your.email@example.com" }
+]
+keywords = [
+    "ai",
+    "llm",
+    "history",
+    "context",
+    "truncation",
+    "summarization",
+    "fastapi",
+    "middleware"
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Framework :: FastAPI",
+]
+dependencies = [
+    "pyyaml>=6.0",
+    "httpx>=0.24.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21.0",
+    "pytest-cov>=4.0",
+    "black>=23.0",
+    "ruff>=0.1.0",
+]
+fastapi = [
+    "fastapi>=0.100.0",
+    "starlette>=0.27.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/yourname/ai-history-manager"
+Documentation = "https://github.com/yourname/ai-history-manager#readme"
+Repository = "https://github.com/yourname/ai-history-manager.git"
+Issues = "https://github.com/yourname/ai-history-manager/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ai_history_manager"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "-v --cov=ai_history_manager --cov-report=term-missing"
+
+[tool.black]
+line-length = 100
+target-version = ["py39", "py310", "py311", "py312"]
+
+[tool.ruff]
+line-length = 100
+select = ["E", "F", "W", "I", "N", "B", "C4", "UP"]
+ignore = ["E501"]

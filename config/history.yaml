@@ -1,0 +1,52 @@
+# AI History Manager 配置文件
+# 用于管理 AI 对话历史消息，处理输入长度限制
+
+history_manager:
+  # 启用的策略（可多选）
+  # - error_retry: 遇到长度错误时截断/摘要后重试 [推荐]
+  # - smart_summary: 用 AI 生成早期对话摘要（需额外 API 调用）
+  # - auto_truncate: 发送前按数量/字符数自动截断
+  # - pre_estimate: 发送前预估 token 数量，超限提前处理
+  strategies:
+    - error_retry
+    - smart_summary
+    - auto_truncate
+    - pre_estimate
+
+  # 基础限制
+  limits:
+    max_messages: 30           # 最大消息数
+    max_chars: 150000          # 最大字符数（约 50k tokens）
+
+  # 智能摘要配置
+  summary:
+    keep_recent: 10            # 摘要时保留最近 N 条完整消息
+    threshold: 100000          # 触发摘要的字符数阈值
+    max_length: 2000           # 摘要最大长度
+
+  # 错误重试配置
+  retry:
+    max_messages: 20           # 重试时保留的消息数
+    max_retries: 2             # 最大重试次数
+
+  # 预估检测配置
+  estimate:
+    threshold: 180000          # 预估阈值（字符数）
+    chars_per_token: 3.0       # 每 token 约等于多少字符
+
+  # 摘要缓存配置
+  cache:
+    enabled: true              # 是否启用摘要缓存
+    min_delta_messages: 3      # 旧历史新增 N 条后刷新摘要
+    min_delta_chars: 4000      # 旧历史新增字符数阈值
+    max_age_seconds: 180       # 摘要最大复用时间（秒）
+    max_entries: 128           # 最大缓存条目数
+
+  # 警告配置
+  warning:
+    add_header: true           # 截断时添加警告信息
+
+  # 日志配置
+  logging:
+    enabled: true              # 是否启用日志
+    level: INFO                # 日志级别 (DEBUG, INFO, WARNING, ERROR)
