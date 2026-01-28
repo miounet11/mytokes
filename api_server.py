@@ -3,8 +3,8 @@
 提供 OpenAI 兼容的 API 接口，集成历史消息管理功能。
 可接入 NewAPI 作为自定义渠道使用。
 
-启动方式:
-    uvicorn api_server:app --host 0.0.0.0 --port 8100
+启动方式 (推荐多 worker):
+    uvicorn api_server:app --host 0.0.0.0 --port 8100 --workers 4 --loop uvloop --http httptools
 
 NewAPI 配置:
     - 类型: 自定义渠道
@@ -18,6 +18,7 @@ import uuid
 import asyncio
 import logging
 from typing import Optional, AsyncIterator
+from contextlib import asynccontextmanager
 
 import httpx
 from fastapi import FastAPI, Request, HTTPException
@@ -60,6 +61,13 @@ HISTORY_CONFIG = HistoryConfig(
 SERVICE_PORT = 8100
 REQUEST_TIMEOUT = 300
 
+# ==================== 高并发配置 ====================
+
+# HTTP 连接池配置 - 针对高并发优化
+HTTP_POOL_MAX_CONNECTIONS = 10000     # 连接池最大连接数
+HTTP_POOL_MAX_KEEPALIVE = 1000        # 保持活跃的连接数
+HTTP_POOL_KEEPALIVE_EXPIRY = 60       # 连接保持时间(秒)
+
 # ==================== 日志 ====================
 
 logging.basicConfig(
@@ -68,12 +76,62 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ai_history_manager_api")
 
+# ==================== 全局 HTTP 客户端 ====================
+
+# 全局 HTTP 客户端 (连接池复用，极致高并发)
+http_client: Optional[httpx.AsyncClient] = None
+
+
+def get_http_client() -> httpx.AsyncClient:
+    """获取全局 HTTP 客户端"""
+    global http_client
+    if http_client is None:
+        raise RuntimeError("HTTP client not initialized. Server not started properly.")
+    return http_client
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """应用生命周期管理 - 初始化和清理全局资源"""
+    global http_client
+
+    # 启动时初始化
+    logger.info("初始化全局 HTTP 客户端 (高并发模式)...")
+
+    # 创建连接池限制 - 大容量
+    limits = httpx.Limits(
+        max_connections=HTTP_POOL_MAX_CONNECTIONS,
+        max_keepalive_connections=HTTP_POOL_MAX_KEEPALIVE,
+        keepalive_expiry=HTTP_POOL_KEEPALIVE_EXPIRY,
+    )
+
+    # 创建全局 HTTP 客户端 - 优化配置
+    http_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(REQUEST_TIMEOUT, connect=10),  # 更快的连接超时
+        limits=limits,
+        http2=True,  # 启用 HTTP/2 多路复用
+    )
+
+    logger.info(f"HTTP 客户端已初始化: max_connections={HTTP_POOL_MAX_CONNECTIONS}, "
+                f"keepalive={HTTP_POOL_MAX_KEEPALIVE}")
+
+    yield  # 应用运行中
+
+    # 关闭时清理
+    logger.info("关闭全局 HTTP 客户端...")
+    if http_client:
+        await http_client.aclose()
+        http_client = None
+    logger.info("资源清理完成")
+
+
 # ==================== FastAPI App ====================
 
 app = FastAPI(
     title="AI History Manager API",
     description="OpenAI 兼容 API，集成智能历史消息管理",
     version="1.0.0",
+    lifespan=lifespan,  # 使用生命周期管理
 )
 
 
@@ -127,7 +185,7 @@ def extract_user_content(messages: list[dict]) -> str:
 
 
 async def call_kiro_for_summary(prompt: str) -> str:
-    """调用 Kiro API 生成摘要"""
+    """调用 Kiro API 生成摘要 - 使用全局 HTTP 客户端"""
     request_body = {
         "model": "claude-haiku-4",  # 使用快速模型
         "messages": [{"role": "user", "content": prompt}],
@@ -141,20 +199,89 @@ async def call_kiro_for_summary(prompt: str) -> str:
     }
 
     try:
-        async with httpx.AsyncClient(timeout=60) as client:
-            response = await client.post(
-                KIRO_PROXY_URL,
-                json=request_body,
-                headers=headers,
-            )
+        client = get_http_client()
+        response = await client.post(
+            KIRO_PROXY_URL,
+            json=request_body,
+            headers=headers,
+            timeout=60,  # 摘要请求使用较短超时
+        )
 
-            if response.status_code == 200:
-                data = response.json()
-                return data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        if response.status_code == 200:
+            data = response.json()
+            return data.get("choices", [{}])[0].get("message", {}).get("content", "")
     except Exception as e:
         logger.warning(f"摘要生成失败: {e}")
 
     return ""
+
+
+# ==================== Token 计数 ====================
+
+def estimate_tokens(text: str) -> int:
+    """估算文本的 token 数量
+
+    简单估算规则：
+    - 英文/代码：约 4 个字符 = 1 token
+    - 中文：约 1.5 个字符 = 1 token
+    - 混合计算取平均
+    """
+    if not text:
+        return 0
+
+    # 统计中文字符数
+    chinese_chars = sum(1 for c in text if '\u4e00' <= c <= '\u9fff')
+    other_chars = len(text) - chinese_chars
+
+    # 中文约 1.5 字符/token，其他约 4 字符/token
+    chinese_tokens = chinese_chars / 1.5
+    other_tokens = other_chars / 4
+
+    return int(chinese_tokens + other_tokens)
+
+
+def estimate_messages_tokens(messages: list, system: str = "") -> int:
+    """估算消息列表的总 token 数"""
+    total = 0
+
+    # system prompt
+    if system:
+        if isinstance(system, str):
+            total += estimate_tokens(system)
+        elif isinstance(system, list):
+            for item in system:
+                if isinstance(item, dict):
+                    total += estimate_tokens(item.get("text", ""))
+                elif isinstance(item, str):
+                    total += estimate_tokens(item)
+
+    # messages
+    for msg in messages:
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            total += estimate_tokens(content)
+        elif isinstance(content, list):
+            for item in content:
+                if isinstance(item, dict):
+                    if item.get("type") == "text":
+                        total += estimate_tokens(item.get("text", ""))
+                    elif item.get("type") == "tool_use":
+                        total += estimate_tokens(json.dumps(item.get("input", {})))
+                    elif item.get("type") == "tool_result":
+                        result = item.get("content", "")
+                        if isinstance(result, str):
+                            total += estimate_tokens(result)
+                        elif isinstance(result, list):
+                            for r in result:
+                                if isinstance(r, dict):
+                                    total += estimate_tokens(r.get("text", ""))
+                elif isinstance(item, str):
+                    total += estimate_tokens(item)
+
+        # 每条消息额外开销（role, formatting等）
+        total += 4
+
+    return total
 
 
 # ==================== API 端点 ====================
@@ -628,6 +755,10 @@ def convert_anthropic_to_openai(anthropic_body: dict) -> dict:
         "stream": anthropic_body.get("stream", False),
     }
 
+    # 流式响应时，请求包含 usage 信息
+    if anthropic_body.get("stream", False):
+        openai_body["stream_options"] = {"include_usage": True}
+
     # 转换参数
     if "max_tokens" in anthropic_body:
         openai_body["max_tokens"] = anthropic_body["max_tokens"]
@@ -1089,6 +1220,10 @@ def convert_anthropic_to_openai_simple(anthropic_body: dict) -> dict:
         "stream": anthropic_body.get("stream", False),
     }
 
+    # 流式响应时，请求包含 usage 信息
+    if anthropic_body.get("stream", False):
+        openai_body["stream_options"] = {"include_usage": True}
+
     if "max_tokens" in anthropic_body:
         openai_body["max_tokens"] = anthropic_body["max_tokens"]
     if "temperature" in anthropic_body:
@@ -1159,165 +1294,197 @@ async def handle_anthropic_stream_via_openai(
 
     关键增强：检测内联工具调用并转换为标准 tool_use content blocks
     策略：累积完整响应后解析，然后正确发送 content blocks
+
+    高并发优化：使用全局 HTTP 客户端连接池
+    Token 计数：支持从 OpenAI API 获取或估算 token 数量
     """
+
+    # 预估输入 token 数
+    estimated_input_tokens = 0
+    for msg in openai_body.get("messages", []):
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            estimated_input_tokens += estimate_tokens(content)
+        elif isinstance(content, list):
+            for item in content:
+                if isinstance(item, dict):
+                    estimated_input_tokens += estimate_tokens(item.get("text", ""))
+                elif isinstance(item, str):
+                    estimated_input_tokens += estimate_tokens(item)
+        estimated_input_tokens += 4  # 每条消息额外开销
 
     async def generate() -> AsyncIterator[bytes]:
         try:
-            async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-                async with client.stream(
-                    "POST",
-                    KIRO_PROXY_URL,
-                    json=openai_body,
-                    headers=headers,
-                ) as response:
-                    if response.status_code != 200:
-                        error_text = await response.aread()
-                        error_str = error_text.decode()
-                        logger.error(f"[{request_id}] OpenAI API Error {response.status_code}: {error_str[:200]}")
+            client = get_http_client()
+            async with client.stream(
+                "POST",
+                KIRO_PROXY_URL,
+                json=openai_body,
+                headers=headers,
+            ) as response:
+                if response.status_code != 200:
+                    error_text = await response.aread()
+                    error_str = error_text.decode()
+                    logger.error(f"[{request_id}] OpenAI API Error {response.status_code}: {error_str[:200]}")
 
-                        error_response = {
-                            "type": "error",
-                            "error": {
-                                "type": "api_error",
-                                "message": error_str[:500],
-                            }
-                        }
-                        yield f"data: {json.dumps(error_response)}\n\n".encode()
-                        return
-
-                    # 发送 Anthropic 流式头
-                    msg_start = {
-                        "type": "message_start",
-                        "message": {
-                            "id": f"msg_{request_id}",
-                            "type": "message",
-                            "role": "assistant",
-                            "content": [],
-                            "model": model,
-                            "stop_reason": None,
-                            "stop_sequence": None,
-                            "usage": {"input_tokens": 0, "output_tokens": 0}
+                    error_response = {
+                        "type": "error",
+                        "error": {
+                            "type": "api_error",
+                            "message": error_str[:500],
                         }
                     }
-                    yield f"data: {json.dumps(msg_start)}\n\n".encode()
+                    yield f"data: {json.dumps(error_response)}\n\n".encode()
+                    return
 
-                    # 累积完整响应文本，然后解析
-                    full_text = ""
-                    buffer = ""
-                    finish_reason = "end_turn"
-                    has_openai_tool_calls = False
-                    openai_tool_calls = {}
+                # 发送 Anthropic 流式头
+                msg_start = {
+                    "type": "message_start",
+                    "message": {
+                        "id": f"msg_{request_id}",
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [],
+                        "model": model,
+                        "stop_reason": None,
+                        "stop_sequence": None,
+                        "usage": {"input_tokens": estimated_input_tokens, "output_tokens": 0}
+                    }
+                }
+                yield f"data: {json.dumps(msg_start)}\n\n".encode()
 
-                    async for chunk in response.aiter_text():
-                        buffer += chunk
-                        while "\n" in buffer:
-                            line, buffer = buffer.split("\n", 1)
-                            line = line.strip()
-                            if not line or not line.startswith("data:"):
-                                continue
+                # 累积完整响应文本，然后解析
+                full_text = ""
+                buffer = ""
+                finish_reason = "end_turn"
+                has_openai_tool_calls = False
+                openai_tool_calls = {}
 
-                            data_str = line[5:].strip()
-                            if data_str == "[DONE]":
-                                continue
+                # Token 计数：从 OpenAI 响应获取
+                input_tokens = estimated_input_tokens  # 默认使用估算值
+                output_tokens = 0
 
-                            try:
-                                data = json.loads(data_str)
-                                choice = data.get("choices", [{}])[0]
-                                delta = choice.get("delta", {})
-                                fr = choice.get("finish_reason")
-                                if fr:
-                                    if fr == "tool_calls":
-                                        finish_reason = "tool_use"
-                                    elif fr == "length":
-                                        finish_reason = "max_tokens"
+                async for chunk in response.aiter_text():
+                    buffer += chunk
+                    while "\n" in buffer:
+                        line, buffer = buffer.split("\n", 1)
+                        line = line.strip()
+                        if not line or not line.startswith("data:"):
+                            continue
 
-                                # 累积文本
-                                content = delta.get("content", "")
-                                if content:
-                                    full_text += content
+                        data_str = line[5:].strip()
+                        if data_str == "[DONE]":
+                            continue
 
-                                # 处理 OpenAI 原生 tool_calls（如果有）
-                                tool_calls = delta.get("tool_calls", [])
-                                for tc in tool_calls:
-                                    tc_index = tc.get("index", 0)
-                                    tc_id = tc.get("id")
-                                    tc_func = tc.get("function", {})
-
-                                    if tc_id:
-                                        has_openai_tool_calls = True
-                                        openai_tool_calls[tc_index] = {
-                                            "id": tc_id,
-                                            "name": tc_func.get("name", ""),
-                                            "arguments": ""
-                                        }
-
-                                    if tc_index in openai_tool_calls and tc_func.get("arguments"):
-                                        openai_tool_calls[tc_index]["arguments"] += tc_func["arguments"]
-
-                            except json.JSONDecodeError:
-                                pass
-
-                    # 解析内联工具调用
-                    tool_uses, remaining_text = parse_inline_tool_calls(full_text)
-
-                    # 添加 OpenAI 原生工具调用
-                    for tc_data in openai_tool_calls.values():
                         try:
-                            args = json.loads(tc_data["arguments"])
-                        except:
-                            args = {"raw": tc_data["arguments"]}
-                        tool_uses.append({
-                            "type": "tool_use",
-                            "id": tc_data["id"],
-                            "name": tc_data["name"],
-                            "input": args
-                        })
+                            data = json.loads(data_str)
 
-                    # 发送 content blocks
-                    block_index = 0
+                            # 捕获 OpenAI usage 信息（stream_options: include_usage）
+                            usage = data.get("usage")
+                            if usage:
+                                input_tokens = usage.get("prompt_tokens", input_tokens)
+                                output_tokens = usage.get("completion_tokens", output_tokens)
 
-                    # 1. 发送文本 content block（如果有）
-                    if remaining_text:
-                        yield f'data: {{"type":"content_block_start","index":{block_index},"content_block":{{"type":"text","text":""}}}}\n\n'.encode()
-                        yield f'data: {{"type":"content_block_delta","index":{block_index},"delta":{{"type":"text_delta","text":{json.dumps(remaining_text)}}}}}\n\n'.encode()
+                            choice = data.get("choices", [{}])[0]
+                            delta = choice.get("delta", {})
+                            fr = choice.get("finish_reason")
+                            if fr:
+                                if fr == "tool_calls":
+                                    finish_reason = "tool_use"
+                                elif fr == "length":
+                                    finish_reason = "max_tokens"
+
+                            # 累积文本
+                            content = delta.get("content", "")
+                            if content:
+                                full_text += content
+
+                            # 处理 OpenAI 原生 tool_calls（如果有）
+                            tool_calls = delta.get("tool_calls", [])
+                            for tc in tool_calls:
+                                tc_index = tc.get("index", 0)
+                                tc_id = tc.get("id")
+                                tc_func = tc.get("function", {})
+
+                                if tc_id:
+                                    has_openai_tool_calls = True
+                                    openai_tool_calls[tc_index] = {
+                                        "id": tc_id,
+                                        "name": tc_func.get("name", ""),
+                                        "arguments": ""
+                                    }
+
+                                if tc_index in openai_tool_calls and tc_func.get("arguments"):
+                                    openai_tool_calls[tc_index]["arguments"] += tc_func["arguments"]
+
+                        except json.JSONDecodeError:
+                            pass
+
+                # 解析内联工具调用
+                tool_uses, remaining_text = parse_inline_tool_calls(full_text)
+
+                # 添加 OpenAI 原生工具调用
+                for tc_data in openai_tool_calls.values():
+                    try:
+                        args = json.loads(tc_data["arguments"])
+                    except:
+                        args = {"raw": tc_data["arguments"]}
+                    tool_uses.append({
+                        "type": "tool_use",
+                        "id": tc_data["id"],
+                        "name": tc_data["name"],
+                        "input": args
+                    })
+
+                # 发送 content blocks
+                block_index = 0
+
+                # 1. 发送文本 content block（如果有）
+                if remaining_text:
+                    yield f'data: {{"type":"content_block_start","index":{block_index},"content_block":{{"type":"text","text":""}}}}\n\n'.encode()
+                    yield f'data: {{"type":"content_block_delta","index":{block_index},"delta":{{"type":"text_delta","text":{json.dumps(remaining_text)}}}}}\n\n'.encode()
+                    yield f'data: {{"type":"content_block_stop","index":{block_index}}}\n\n'.encode()
+                    block_index += 1
+                elif not tool_uses:
+                    # 没有文本也没有工具，发送空文本
+                    yield f'data: {{"type":"content_block_start","index":0,"content_block":{{"type":"text","text":""}}}}\n\n'.encode()
+                    yield f'data: {{"type":"content_block_stop","index":0}}\n\n'.encode()
+                    block_index = 1
+
+                # 2. 发送 tool_use content blocks
+                if tool_uses:
+                    finish_reason = "tool_use"
+                    for tool_use in tool_uses:
+                        # content_block_start
+                        tool_start = {
+                            "type": "content_block_start",
+                            "index": block_index,
+                            "content_block": {
+                                "type": "tool_use",
+                                "id": tool_use["id"],
+                                "name": tool_use["name"],
+                                "input": {}
+                            }
+                        }
+                        yield f"data: {json.dumps(tool_start)}\n\n".encode()
+
+                        # input_json_delta
+                        input_json = json.dumps(tool_use["input"])
+                        yield f'data: {{"type":"content_block_delta","index":{block_index},"delta":{{"type":"input_json_delta","partial_json":{json.dumps(input_json)}}}}}\n\n'.encode()
+
+                        # content_block_stop
                         yield f'data: {{"type":"content_block_stop","index":{block_index}}}\n\n'.encode()
                         block_index += 1
-                    elif not tool_uses:
-                        # 没有文本也没有工具，发送空文本
-                        yield f'data: {{"type":"content_block_start","index":0,"content_block":{{"type":"text","text":""}}}}\n\n'.encode()
-                        yield f'data: {{"type":"content_block_stop","index":0}}\n\n'.encode()
-                        block_index = 1
 
-                    # 2. 发送 tool_use content blocks
-                    if tool_uses:
-                        finish_reason = "tool_use"
-                        for tool_use in tool_uses:
-                            # content_block_start
-                            tool_start = {
-                                "type": "content_block_start",
-                                "index": block_index,
-                                "content_block": {
-                                    "type": "tool_use",
-                                    "id": tool_use["id"],
-                                    "name": tool_use["name"],
-                                    "input": {}
-                                }
-                            }
-                            yield f"data: {json.dumps(tool_start)}\n\n".encode()
+                # 如果 OpenAI 没有返回 usage，使用估算值
+                if output_tokens == 0:
+                    output_tokens = estimate_tokens(full_text)
 
-                            # input_json_delta
-                            input_json = json.dumps(tool_use["input"])
-                            yield f'data: {{"type":"content_block_delta","index":{block_index},"delta":{{"type":"input_json_delta","partial_json":{json.dumps(input_json)}}}}}\n\n'.encode()
+                # message delta with token usage
+                yield f'data: {{"type":"message_delta","delta":{{"stop_reason":"{finish_reason}","stop_sequence":null}},"usage":{{"output_tokens":{output_tokens}}}}}\n\n'.encode()
 
-                            # content_block_stop
-                            yield f'data: {{"type":"content_block_stop","index":{block_index}}}\n\n'.encode()
-                            block_index += 1
-
-                    # message delta
-                    yield f'data: {{"type":"message_delta","delta":{{"stop_reason":"{finish_reason}","stop_sequence":null}},"usage":{{"output_tokens":0}}}}\n\n'.encode()
-
-                    # message stop
-                    yield f'data: {{"type":"message_stop"}}\n\n'.encode()
+                # message stop
+                yield f'data: {{"type":"message_stop"}}\n\n'.encode()
 
         except httpx.TimeoutException:
             logger.error(f"[{request_id}] 请求超时")
@@ -1351,34 +1518,37 @@ async def handle_anthropic_non_stream_via_openai(
     request_id: str,
     model: str,
 ) -> JSONResponse:
-    """处理 Anthropic 非流式请求 - 通过 OpenAI 格式"""
+    """处理 Anthropic 非流式请求 - 通过 OpenAI 格式
+
+    高并发优化：使用全局 HTTP 客户端连接池
+    """
     try:
-        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-            response = await client.post(
-                KIRO_PROXY_URL,
-                json=openai_body,
-                headers=headers,
+        client = get_http_client()
+        response = await client.post(
+            KIRO_PROXY_URL,
+            json=openai_body,
+            headers=headers,
+        )
+
+        if response.status_code != 200:
+            error_str = response.text
+            logger.error(f"[{request_id}] OpenAI API Error {response.status_code}: {error_str[:200]}")
+
+            return JSONResponse(
+                status_code=response.status_code,
+                content={
+                    "type": "error",
+                    "error": {
+                        "type": "api_error",
+                        "message": error_str[:500],
+                    }
+                }
             )
 
-            if response.status_code != 200:
-                error_str = response.text
-                logger.error(f"[{request_id}] OpenAI API Error {response.status_code}: {error_str[:200]}")
-
-                return JSONResponse(
-                    status_code=response.status_code,
-                    content={
-                        "type": "error",
-                        "error": {
-                            "type": "api_error",
-                            "message": error_str[:500],
-                        }
-                    }
-                )
-
-            # 转换 OpenAI 响应为 Anthropic 格式
-            openai_response = response.json()
-            anthropic_response = convert_openai_to_anthropic(openai_response, model, request_id)
-            return JSONResponse(content=anthropic_response)
+        # 转换 OpenAI 响应为 Anthropic 格式
+        openai_response = response.json()
+        anthropic_response = convert_openai_to_anthropic(openai_response, model, request_id)
+        return JSONResponse(content=anthropic_response)
 
     except httpx.TimeoutException:
         logger.error(f"[{request_id}] 请求超时")
@@ -1469,7 +1639,7 @@ async def handle_stream(
     request_id: str,
     original_messages: list,
 ) -> StreamingResponse:
-    """处理流式响应"""
+    """处理流式响应 - 使用全局 HTTP 客户端，无并发限制"""
 
     async def generate() -> AsyncIterator[bytes]:
         nonlocal kiro_request
@@ -1478,53 +1648,53 @@ async def handle_stream(
 
         while retry_count <= max_retries:
             try:
-                async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-                    async with client.stream(
-                        "POST",
-                        KIRO_PROXY_URL,
-                        json=kiro_request,
-                        headers=headers,
-                    ) as response:
+                client = get_http_client()
+                async with client.stream(
+                    "POST",
+                    KIRO_PROXY_URL,
+                    json=kiro_request,
+                    headers=headers,
+                ) as response:
 
-                        if response.status_code != 200:
-                            error_text = await response.aread()
-                            error_str = error_text.decode()
+                    if response.status_code != 200:
+                        error_text = await response.aread()
+                        error_str = error_text.decode()
 
-                            logger.error(f"[{request_id}] Kiro API Error {response.status_code}: {error_str[:200]}")
+                        logger.error(f"[{request_id}] Kiro API Error {response.status_code}: {error_str[:200]}")
 
-                            # 检查是否为长度错误
-                            if is_content_length_error(response.status_code, error_str):
-                                logger.info(f"[{request_id}] 检测到长度错误，尝试截断重试")
+                        # 检查是否为长度错误
+                        if is_content_length_error(response.status_code, error_str):
+                            logger.info(f"[{request_id}] 检测到长度错误，尝试截断重试")
 
-                                truncated, should_retry = await manager.handle_length_error_async(
-                                    kiro_request["messages"],
-                                    retry_count,
-                                    call_kiro_for_summary,
-                                )
+                            truncated, should_retry = await manager.handle_length_error_async(
+                                kiro_request["messages"],
+                                retry_count,
+                                call_kiro_for_summary,
+                            )
 
-                                if should_retry:
-                                    kiro_request["messages"] = truncated
-                                    retry_count += 1
-                                    logger.info(f"[{request_id}] {manager.truncate_info}")
-                                    continue
+                            if should_retry:
+                                kiro_request["messages"] = truncated
+                                retry_count += 1
+                                logger.info(f"[{request_id}] {manager.truncate_info}")
+                                continue
 
-                            # 返回错误
-                            error_response = {
-                                "error": {
-                                    "message": error_str[:500],
-                                    "type": "api_error",
-                                    "code": response.status_code,
-                                }
+                        # 返回错误
+                        error_response = {
+                            "error": {
+                                "message": error_str[:500],
+                                "type": "api_error",
+                                "code": response.status_code,
                             }
-                            yield f"data: {json.dumps(error_response)}\n\n".encode()
-                            yield b"data: [DONE]\n\n"
-                            return
-
-                        # 正常流式响应
-                        async for chunk in response.aiter_bytes():
-                            yield chunk
-
+                        }
+                        yield f"data: {json.dumps(error_response)}\n\n".encode()
+                        yield b"data: [DONE]\n\n"
                         return
+
+                    # 正常流式响应
+                    async for chunk in response.aiter_bytes():
+                        yield chunk
+
+                    return
 
             except httpx.TimeoutException:
                 logger.error(f"[{request_id}] 请求超时")
@@ -1563,42 +1733,42 @@ async def handle_non_stream(
     request_id: str,
     original_messages: list,
 ) -> JSONResponse:
-    """处理非流式响应"""
+    """处理非流式响应 - 使用全局 HTTP 客户端，无并发限制"""
     retry_count = 0
     max_retries = HISTORY_CONFIG.max_retries
 
     while retry_count <= max_retries:
         try:
-            async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-                response = await client.post(
-                    KIRO_PROXY_URL,
-                    json=kiro_request,
-                    headers=headers,
-                )
+            client = get_http_client()
+            response = await client.post(
+                KIRO_PROXY_URL,
+                json=kiro_request,
+                headers=headers,
+            )
 
-                if response.status_code != 200:
-                    error_str = response.text
-                    logger.error(f"[{request_id}] Kiro API Error {response.status_code}: {error_str[:200]}")
+            if response.status_code != 200:
+                error_str = response.text
+                logger.error(f"[{request_id}] Kiro API Error {response.status_code}: {error_str[:200]}")
 
-                    # 检查是否为长度错误
-                    if is_content_length_error(response.status_code, error_str):
-                        logger.info(f"[{request_id}] 检测到长度错误，尝试截断重试")
+                # 检查是否为长度错误
+                if is_content_length_error(response.status_code, error_str):
+                    logger.info(f"[{request_id}] 检测到长度错误，尝试截断重试")
 
-                        truncated, should_retry = await manager.handle_length_error_async(
-                            kiro_request["messages"],
-                            retry_count,
-                            call_kiro_for_summary,
-                        )
+                    truncated, should_retry = await manager.handle_length_error_async(
+                        kiro_request["messages"],
+                        retry_count,
+                        call_kiro_for_summary,
+                    )
 
-                        if should_retry:
-                            kiro_request["messages"] = truncated
-                            retry_count += 1
-                            logger.info(f"[{request_id}] {manager.truncate_info}")
-                            continue
+                    if should_retry:
+                        kiro_request["messages"] = truncated
+                        retry_count += 1
+                        logger.info(f"[{request_id}] {manager.truncate_info}")
+                        continue
 
-                    raise HTTPException(response.status_code, error_str[:500])
+                raise HTTPException(response.status_code, error_str[:500])
 
-                return JSONResponse(content=response.json())
+            return JSONResponse(content=response.json())
 
         except HTTPException:
             raise
