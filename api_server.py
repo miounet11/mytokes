@@ -61,12 +61,306 @@ HISTORY_CONFIG = HistoryConfig(
 SERVICE_PORT = 8100
 REQUEST_TIMEOUT = 300
 
+# ==================== 智能模型路由配置 ====================
+
+# 模型路由配置 - 智能判断何时使用 Opus vs Sonnet
+# 设计原则：
+# 1. Opus 用于真正需要深度推理的关键时刻（创建、设计、架构）
+# 2. Sonnet 用于执行性任务（工具调用、简单修改）
+# 3. 保证 10-20% 的 Opus 使用比例
+MODEL_ROUTING_CONFIG = {
+    # 启用智能路由
+    "enabled": True,
+
+    # 目标模型映射
+    "opus_model": "claude-opus-4-5-20251101",
+    "sonnet_model": "claude-sonnet-4-5-20250929",
+
+    # ============================================================
+    # 第一优先级：强制 Opus 的关键词（最后一条用户消息包含）
+    # 这些是真正需要深度思考的任务 - 收紧列表
+    # ============================================================
+    "force_opus_keywords": [
+        # 创建类 - 只有完整的创建任务
+        "创建项目", "新建项目", "初始化项目", "搭建项目",
+        "create project", "new project", "init project",
+        # 设计架构类 - 需要架构思维
+        "设计架构", "系统设计", "架构设计", "方案设计",
+        "design architecture", "system design", "architecture design",
+        # 深度分析类
+        "深度分析", "全面分析", "详细分析", "根因分析",
+        "deep analysis", "comprehensive analysis", "root cause",
+        # 重构类 - 大规模重构
+        "全面重构", "整体重构", "大规模重构",
+        "full refactor", "major refactor", "complete refactor",
+        # 复杂规划
+        "整体规划", "系统规划", "战略规划",
+        "overall plan", "strategic plan",
+    ],
+
+    # ============================================================
+    # 第二优先级：强制 Sonnet 的关键词（执行性任务）- 扩展列表
+    # ============================================================
+    "force_sonnet_keywords": [
+        # 简单操作
+        "看看", "检查", "查看", "显示", "列出", "打开",
+        "check", "show", "list", "display", "view", "open",
+        # 小改动
+        "修复", "修改", "调整", "更新", "改一下", "改成",
+        "fix", "modify", "adjust", "update", "change",
+        # 执行命令
+        "运行", "执行", "测试", "启动", "重启", "停止",
+        "run", "execute", "test", "start", "restart", "stop",
+        # 简单问答
+        "什么是", "怎么", "哪里", "是不是", "有没有",
+        "what is", "how to", "where", "is it", "do you",
+        # 读取类
+        "读取", "获取", "查询", "搜索",
+        "read", "get", "query", "search", "find",
+        # 安装类
+        "安装", "下载", "添加依赖",
+        "install", "download", "add dependency",
+    ],
+
+    # ============================================================
+    # 第三优先级：基于对话阶段的智能判断
+    # ============================================================
+
+    # 首轮对话检测 - 新任务开始需要一定概率 Opus（但控制比例）
+    "first_turn_opus_probability": 25,    # 首轮 25% 概率用 Opus（进一步降低）
+
+    # 用户消息数阈值（不含 system）- 判断是否为首轮
+    "first_turn_max_user_messages": 2,    # <= 2 条用户消息视为首轮
+
+    # 工具执行阶段检测 - 大量工具调用说明在执行阶段
+    "execution_phase_tool_calls": 3,      # 工具调用 >= 3 次视为执行阶段
+    "execution_phase_sonnet_probability": 95,  # 执行阶段 95% 用 Sonnet
+
+    # ============================================================
+    # 第四优先级：保底概率（确保 10-20% Opus 使用率）
+    # ============================================================
+    "base_opus_probability": 10,          # 基础 10% 概率使用 Opus（降低）
+
+    # ============================================================
+    # 调试和监控
+    # ============================================================
+    "log_routing_decision": True,         # 记录路由决策原因
+}
+
+
+class ModelRouter:
+    """智能模型路由器 - 根据请求复杂度决定使用 Opus 还是 Sonnet"""
+
+    def __init__(self, config: dict = None):
+        self.config = config or MODEL_ROUTING_CONFIG
+        self.stats = {"opus": 0, "sonnet": 0, "other": 0}
+        self._lock = asyncio.Lock()
+
+    def _count_chars(self, messages: list, system: str = "") -> int:
+        """统计总字符数"""
+        total = len(str(system)) if system else 0
+        for msg in messages:
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                total += len(content)
+            elif isinstance(content, list):
+                for item in content:
+                    if isinstance(item, dict):
+                        total += len(str(item.get("text", "")))
+                        total += len(str(item.get("content", "")))
+                    elif isinstance(item, str):
+                        total += len(item)
+        return total
+
+    def _count_tool_calls(self, messages: list) -> int:
+        """统计历史中的工具调用次数"""
+        count = 0
+        for msg in messages:
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                for item in content:
+                    if isinstance(item, dict):
+                        if item.get("type") in ("tool_use", "tool_result"):
+                            count += 1
+        return count
+
+    def _count_files_mentioned(self, messages: list) -> int:
+        """统计提及的文件数量（简单估算）"""
+        import re
+        files = set()
+        file_pattern = r'[/\\][\w\-\.]+\.(py|js|ts|jsx|tsx|go|rs|java|cpp|c|h|md|yaml|yml|json|toml)'
+
+        for msg in messages:
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                matches = re.findall(file_pattern, content)
+                files.update(matches)
+            elif isinstance(content, list):
+                for item in content:
+                    if isinstance(item, dict):
+                        text = item.get("text", "") or item.get("content", "")
+                        if isinstance(text, str):
+                            matches = re.findall(file_pattern, text)
+                            files.update(matches)
+        return len(files)
+
+    def _get_last_user_message(self, messages: list) -> str:
+        """获取最后一条用户消息"""
+        for msg in reversed(messages):
+            if msg.get("role") == "user":
+                content = msg.get("content", "")
+                if isinstance(content, str):
+                    return content
+                elif isinstance(content, list):
+                    texts = []
+                    for item in content:
+                        if isinstance(item, dict) and item.get("type") == "text":
+                            texts.append(item.get("text", ""))
+                    return " ".join(texts)
+        return ""
+
+    def _contains_keywords(self, text: str, keywords: list) -> bool:
+        """检查文本是否包含关键词"""
+        text_lower = text.lower()
+        for kw in keywords:
+            if kw.lower() in text_lower:
+                return True
+        return False
+
+    def _count_user_messages(self, messages: list) -> int:
+        """统计用户消息数量"""
+        return sum(1 for msg in messages if msg.get("role") == "user")
+
+    def _get_hash_probability(self, seed: str, threshold: int) -> bool:
+        """基于哈希的概率判断，确保相同输入得到相同结果"""
+        import hashlib
+        hash_val = int(hashlib.md5(seed.encode()).hexdigest()[:8], 16)
+        return (hash_val % 100) < threshold
+
+    def should_use_opus(self, request_body: dict) -> tuple[bool, str]:
+        """
+        智能判断是否应该使用 Opus
+
+        决策优先级：
+        1. 强制 Opus 关键词 → Opus
+        2. 强制 Sonnet 关键词 → Sonnet
+        3. 首轮对话（新任务）→ 高概率 Opus
+        4. 执行阶段（大量工具调用）→ 高概率 Sonnet
+        5. 保底概率 → 确保 ~15% Opus
+
+        Returns:
+            (should_use_opus, reason)
+        """
+        if not self.config.get("enabled", True):
+            return True, "路由已禁用"
+
+        messages = request_body.get("messages", [])
+        last_user_msg = self._get_last_user_message(messages)
+
+        # 生成稳定的哈希种子（相同请求得到相同结果）
+        hash_seed = f"{len(messages)}:{last_user_msg[:200]}"
+
+        # ============================================================
+        # 第一优先级：强制 Opus 关键词
+        # ============================================================
+        force_opus_keywords = self.config.get("force_opus_keywords", [])
+        if self._contains_keywords(last_user_msg, force_opus_keywords):
+            # 找出匹配的关键词
+            matched = [kw for kw in force_opus_keywords if kw.lower() in last_user_msg.lower()]
+            return True, f"关键词[{matched[0] if matched else '?'}]"
+
+        # ============================================================
+        # 第二优先级：强制 Sonnet 关键词
+        # ============================================================
+        force_sonnet_keywords = self.config.get("force_sonnet_keywords", [])
+        if self._contains_keywords(last_user_msg, force_sonnet_keywords):
+            matched = [kw for kw in force_sonnet_keywords if kw.lower() in last_user_msg.lower()]
+            return False, f"简单任务[{matched[0] if matched else '?'}]"
+
+        # ============================================================
+        # 第三优先级：对话阶段判断
+        # ============================================================
+        user_msg_count = self._count_user_messages(messages)
+        tool_calls = self._count_tool_calls(messages)
+
+        # 3a. 首轮对话检测 - 新任务开始更需要 Opus
+        first_turn_max = self.config.get("first_turn_max_user_messages", 2)
+        if user_msg_count <= first_turn_max:
+            first_turn_prob = self.config.get("first_turn_opus_probability", 70)
+            if self._get_hash_probability(hash_seed + ":first", first_turn_prob):
+                return True, f"首轮对话({user_msg_count}条,{first_turn_prob}%)"
+            else:
+                return False, f"首轮随机Sonnet({user_msg_count}条)"
+
+        # 3b. 执行阶段检测 - 大量工具调用说明在执行，用 Sonnet
+        execution_threshold = self.config.get("execution_phase_tool_calls", 5)
+        if tool_calls >= execution_threshold:
+            sonnet_prob = self.config.get("execution_phase_sonnet_probability", 90)
+            if self._get_hash_probability(hash_seed + ":exec", sonnet_prob):
+                return False, f"执行阶段({tool_calls}次工具,{sonnet_prob}%Sonnet)"
+            else:
+                return True, f"执行阶段随机Opus({tool_calls}次工具)"
+
+        # ============================================================
+        # 第四优先级：保底概率
+        # ============================================================
+        base_opus_prob = self.config.get("base_opus_probability", 15)
+        if self._get_hash_probability(hash_seed + ":base", base_opus_prob):
+            return True, f"保底概率({base_opus_prob}%)"
+        else:
+            return False, f"默认Sonnet(msg={user_msg_count},tools={tool_calls})"
+
+    def route(self, request_body: dict) -> tuple[str, str]:
+        """
+        路由到合适的模型
+
+        Returns:
+            (routed_model, reason)
+        """
+        original_model = request_body.get("model", "")
+
+        # 只处理 Opus 请求
+        if "opus" not in original_model.lower():
+            self.stats["other"] += 1
+            return original_model, "非Opus请求"
+
+        should_opus, reason = self.should_use_opus(request_body)
+
+        if should_opus:
+            self.stats["opus"] += 1
+            return self.config.get("opus_model", "claude-opus-4-5-20251101"), reason
+        else:
+            self.stats["sonnet"] += 1
+            return self.config.get("sonnet_model", "claude-sonnet-4-5-20250929"), reason
+
+    def get_stats(self) -> dict:
+        """获取路由统计"""
+        total = self.stats["opus"] + self.stats["sonnet"]
+        if total == 0:
+            ratio = "N/A"
+        else:
+            ratio = f"1:{self.stats['sonnet'] / max(self.stats['opus'], 1):.1f}"
+
+        return {
+            "opus_requests": self.stats["opus"],
+            "sonnet_requests": self.stats["sonnet"],
+            "other_requests": self.stats["other"],
+            "opus_sonnet_ratio": ratio,
+        }
+
+
+# 全局模型路由器实例
+model_router = ModelRouter(MODEL_ROUTING_CONFIG)
+
 # ==================== 高并发配置 ====================
 
 # HTTP 连接池配置 - 针对高并发优化
-HTTP_POOL_MAX_CONNECTIONS = 10000     # 连接池最大连接数
-HTTP_POOL_MAX_KEEPALIVE = 1000        # 保持活跃的连接数
-HTTP_POOL_KEEPALIVE_EXPIRY = 60       # 连接保持时间(秒)
+# 关键：禁用 HTTP/2，使用 HTTP/1.1 多连接模式
+# 原因：HTTP/2 多路复用会让所有请求走同一连接，tokens 可能误认为是同一终端
+HTTP_POOL_MAX_CONNECTIONS = 500       # 最大并发连接数
+HTTP_POOL_MAX_KEEPALIVE = 100         # 保持活跃的连接数
+HTTP_POOL_KEEPALIVE_EXPIRY = 30       # 连接保持时间(秒)
+HTTP_USE_HTTP2 = False                # 禁用 HTTP/2，使用 HTTP/1.1 多连接
 
 # ==================== 日志 ====================
 
@@ -106,10 +400,13 @@ async def lifespan(app: FastAPI):
     )
 
     # 创建全局 HTTP 客户端 - 优化配置
+    # 关键修改：禁用 HTTP/2，使用 HTTP/1.1
+    # 原因：HTTP/2 多路复用让所有请求走同一连接，tokens 可能误认为是同一终端
+    # HTTP/1.1 允许多个独立的 TCP 连接，每个请求可以并行处理
     http_client = httpx.AsyncClient(
         timeout=httpx.Timeout(REQUEST_TIMEOUT, connect=10),  # 更快的连接超时
         limits=limits,
-        http2=True,  # 启用 HTTP/2 多路复用
+        http2=HTTP_USE_HTTP2,  # 使用配置的 HTTP 版本
     )
 
     logger.info(f"HTTP 客户端已初始化: max_connections={HTTP_POOL_MAX_CONNECTIONS}, "
@@ -186,6 +483,7 @@ def extract_user_content(messages: list[dict]) -> str:
 
 async def call_kiro_for_summary(prompt: str) -> str:
     """调用 Kiro API 生成摘要 - 使用全局 HTTP 客户端"""
+    summary_id = uuid.uuid4().hex[:8]
     request_body = {
         "model": "claude-haiku-4",  # 使用快速模型
         "messages": [{"role": "user", "content": prompt}],
@@ -193,9 +491,12 @@ async def call_kiro_for_summary(prompt: str) -> str:
         "max_tokens": 2000,
     }
 
+    # 添加唯一请求标识
     headers = {
         "Authorization": f"Bearer {KIRO_API_KEY}",
         "Content-Type": "application/json",
+        "X-Request-ID": f"summary_{summary_id}",
+        "X-Trace-ID": f"trace_{uuid.uuid4().hex}",
     }
 
     try:
@@ -294,6 +595,32 @@ async def root():
         "service": "AI History Manager API",
         "version": "1.0.0",
     }
+
+
+@app.get("/admin/routing/stats")
+async def routing_stats():
+    """获取模型路由统计信息"""
+    stats = model_router.get_stats()
+    return {
+        "status": "ok",
+        "routing": {
+            "enabled": MODEL_ROUTING_CONFIG.get("enabled", True),
+            "stats": stats,
+            "config": {
+                "opus_model": MODEL_ROUTING_CONFIG.get("opus_model"),
+                "sonnet_model": MODEL_ROUTING_CONFIG.get("sonnet_model"),
+                "total_chars_threshold": MODEL_ROUTING_CONFIG.get("total_chars_threshold"),
+                "message_count_threshold": MODEL_ROUTING_CONFIG.get("message_count_threshold"),
+            }
+        }
+    }
+
+
+@app.post("/admin/routing/reset")
+async def reset_routing_stats():
+    """重置路由统计"""
+    model_router.stats = {"opus": 0, "sonnet": 0, "other": 0}
+    return {"status": "ok", "message": "Routing stats reset"}
 
 
 @app.get("/v1/models")
@@ -608,12 +935,14 @@ def convert_anthropic_to_openai(anthropic_body: dict) -> dict:
 
     # 转换 messages
     converted_messages = []
+
     for msg in raw_messages:
         role = msg.get("role", "user")
         content = msg.get("content", "")
 
         # 处理 content 为列表的情况 (多模态/工具调用)
         if isinstance(content, list):
+            # 使用内联文本格式（网关不支持 OpenAI tool_calls）
             text_parts = []
 
             for item in content:
@@ -621,8 +950,6 @@ def convert_anthropic_to_openai(anthropic_body: dict) -> dict:
                     item_type = item.get("type", "")
 
                     if item_type == "tool_use":
-                        # 将 tool_use 转为文本描述
-                        # tokens 网关不完整支持 OpenAI tool_calls → Kiro toolUses
                         tool_name = item.get("name", "unknown")
                         tool_input = item.get("input", {})
                         input_str = json.dumps(tool_input, ensure_ascii=False)
@@ -630,11 +957,9 @@ def convert_anthropic_to_openai(anthropic_body: dict) -> dict:
                             input_str = input_str[:5000] + "...[truncated]"
                         text_parts.append(f"[Calling tool: {tool_name}]\nInput: {input_str}")
                     elif item_type == "tool_result":
-                        # 将 tool_result 转为文本描述
                         tool_content = item.get("content", "")
                         is_error = item.get("is_error", False)
 
-                        # 处理 content 可能是列表的情况
                         if isinstance(tool_content, list):
                             parts = []
                             for c in tool_content:
@@ -655,12 +980,12 @@ def convert_anthropic_to_openai(anthropic_body: dict) -> dict:
                             tool_content = "Error" if is_error else "OK"
 
                         prefix = "[Tool Error]" if is_error else "[Tool Result]"
-                        # 截断过长工具结果
                         if len(tool_content) > MAX_SINGLE_CONTENT:
                             tool_content = tool_content[:MAX_SINGLE_CONTENT] + "\n...[truncated]"
                         text_parts.append(f"{prefix}\n{tool_content}")
+                    elif item_type == "thinking":
+                        pass  # 忽略 thinking blocks
                     else:
-                        # 使用通用提取函数处理其他类型
                         extracted = extract_content_item(item)
                         if extracted:
                             text_parts.append(extracted)
@@ -669,22 +994,18 @@ def convert_anthropic_to_openai(anthropic_body: dict) -> dict:
 
             content = "\n".join(filter(None, text_parts))
 
-            # 清理 assistant 消息中的格式化标记
             if role == "assistant":
                 content = clean_assistant_content(content)
 
-            # 截断过长内容
             if len(content) > MAX_SINGLE_CONTENT:
                 content = content[:MAX_SINGLE_CONTENT] + "\n...[truncated]"
 
-            # 添加消息（简单的 role + content，不再使用 tool_calls/role="tool"）
             if content.strip():
                 converted_messages.append({
                     "role": role,
                     "content": content
                 })
             elif role == "assistant":
-                # assistant 消息即使没有文本也需要占位
                 converted_messages.append({
                     "role": "assistant",
                     "content": "I understand."
@@ -769,11 +1090,82 @@ def convert_anthropic_to_openai(anthropic_body: dict) -> dict:
     if "stop_sequences" in anthropic_body:
         openai_body["stop"] = anthropic_body["stop_sequences"]
 
-    # 注意：不传递 tools/tool_choice 参数
-    # tokens 网关 Kiro 渠道不完整支持 OpenAI tool_calls → Kiro toolUses
-    # 工具调用和结果已被内联为文本内容
+    # ==================== 工具定义注入系统提示 ====================
+    # 网关不支持 OpenAI tool_calls，将工具定义注入系统提示
+    # 模型通过 [Calling tool: xxx] 格式调用工具，响应时自动解析
+    anthropic_tools = anthropic_body.get("tools", [])
+    if anthropic_tools:
+        tool_instruction = build_tool_instruction(anthropic_tools)
+        # 找到 system 消息并追加工具指令
+        for msg in openai_body["messages"]:
+            if msg.get("role") == "system":
+                msg["content"] = msg["content"] + "\n\n" + tool_instruction
+                break
+        else:
+            # 没有 system 消息，创建一个
+            openai_body["messages"].insert(0, {
+                "role": "system",
+                "content": tool_instruction
+            })
 
     return openai_body
+
+
+def build_tool_instruction(tools: list) -> str:
+    """将 Anthropic tools 转换为系统提示中的工具指令文本
+
+    这样模型即使没有 OpenAI tools 参数也知道如何调用工具。
+    """
+    lines = [
+        "# Tool Call Format",
+        "",
+        "You have access to the following tools. To call a tool, output EXACTLY this format:",
+        "",
+        "[Calling tool: tool_name]",
+        "Input: {\"param\": \"value\"}",
+        "",
+        "IMPORTANT RULES:",
+        "- You MUST use the exact format above to call tools",
+        "- The Input MUST be valid JSON on a single line",
+        "- You can call multiple tools in sequence",
+        "- After each tool call, you will receive the result as [Tool Result]",
+        "- NEVER show tool calls as code blocks or plain text - ALWAYS use [Calling tool: ...] format",
+        "",
+        "## Available Tools",
+        "",
+    ]
+
+    for tool in tools:
+        name = tool.get("name", "unknown")
+        desc = tool.get("description", "")
+        schema = tool.get("input_schema", {})
+
+        lines.append(f"### {name}")
+        if desc:
+            # 截断过长描述
+            if len(desc) > 500:
+                desc = desc[:500] + "..."
+            lines.append(desc)
+
+        # 添加参数信息
+        props = schema.get("properties", {}) or {}
+        required = schema.get("required") or []
+        if props:
+            lines.append("Parameters:")
+            for pname, pschema in props.items():
+                ptype = pschema.get("type", "any")
+                pdesc = pschema.get("description", "")
+                req_mark = " (required)" if pname in required else ""
+                if pdesc:
+                    # 截断参数描述
+                    if len(pdesc) > 200:
+                        pdesc = pdesc[:200] + "..."
+                    lines.append(f"  - {pname}: {ptype}{req_mark} - {pdesc}")
+                else:
+                    lines.append(f"  - {pname}: {ptype}{req_mark}")
+        lines.append("")
+
+    return "\n".join(lines)
 
 
 def escape_json_string_newlines(json_str: str) -> str:
@@ -830,6 +1222,79 @@ def escape_json_string_newlines(json_str: str) -> str:
     return ''.join(result)
 
 
+def _try_parse_json(json_str: str, end_pos: int) -> tuple[dict, int]:
+    """尝试多种方式解析 JSON 字符串
+
+    Args:
+        json_str: JSON 字符串
+        end_pos: 成功时返回的结束位置
+
+    Returns:
+        (parsed_json, end_position) 或抛出异常
+    """
+    import re
+
+    # 直接解析
+    try:
+        return json.loads(json_str), end_pos
+    except json.JSONDecodeError:
+        pass
+
+    # 修复策略 1: 移除尾随逗号
+    try:
+        fixed = re.sub(r',\s*}', '}', json_str)
+        fixed = re.sub(r',\s*]', ']', fixed)
+        return json.loads(fixed), end_pos
+    except json.JSONDecodeError:
+        pass
+
+    # 修复策略 2: 转义字符串内的控制字符
+    try:
+        fixed = escape_json_string_newlines(json_str)
+        return json.loads(fixed), end_pos
+    except json.JSONDecodeError:
+        pass
+
+    # 修复策略 3: 组合修复
+    try:
+        fixed = escape_json_string_newlines(json_str)
+        fixed = re.sub(r',\s*}', '}', fixed)
+        fixed = re.sub(r',\s*]', ']', fixed)
+        return json.loads(fixed), end_pos
+    except json.JSONDecodeError:
+        pass
+
+    # 修复策略 4: 处理截断的字符串值
+    # 如果 JSON 在字符串中间被截断，尝试闭合
+    try:
+        # 检查未闭合的引号
+        quote_count = json_str.count('"') - json_str.count('\\"')
+        if quote_count % 2 == 1:
+            # 奇数个引号，尝试闭合
+            fixed = json_str.rstrip()
+            if not fixed.endswith('"'):
+                fixed = fixed + '"'
+            # 检查是否需要闭合对象
+            open_braces = fixed.count('{') - fixed.count('}')
+            if open_braces > 0:
+                fixed = fixed + '}' * open_braces
+            return json.loads(fixed), end_pos
+    except json.JSONDecodeError:
+        pass
+
+    # 修复策略 5: 提取有效的 JSON 子集
+    # 尝试找到最长的有效 JSON 前缀
+    try:
+        # 使用 json.JSONDecoder 来找到有效部分
+        decoder = json.JSONDecoder()
+        obj, idx = decoder.raw_decode(json_str)
+        return obj, end_pos
+    except json.JSONDecodeError:
+        pass
+
+    raise json.JSONDecodeError("Failed to parse JSON after all recovery attempts", json_str, 0)
+
+
 def extract_json_from_position(text: str, start: int) -> tuple[dict, int]:
     """从指定位置提取 JSON 对象，支持任意嵌套深度
 
@@ -840,6 +1305,8 @@ def extract_json_from_position(text: str, start: int) -> tuple[dict, int]:
     Returns:
         (parsed_json, end_position) 或抛出异常
     """
+    import re
+
     # 跳过空白找到 '{'
     pos = start
     while pos < len(text) and text[pos] in ' \t\n\r':
@@ -853,6 +1320,7 @@ def extract_json_from_position(text: str, start: int) -> tuple[dict, int]:
     in_string = False
     escape = False
     json_start = pos
+    max_depth_reached = 0
 
     while pos < len(text):
         c = text[pos]
@@ -878,40 +1346,49 @@ def extract_json_from_position(text: str, start: int) -> tuple[dict, int]:
 
         if c == '{':
             depth += 1
+            max_depth_reached = max(max_depth_reached, depth)
         elif c == '}':
             depth -= 1
             if depth == 0:
                 json_str = text[json_start:pos + 1]
-                try:
-                    return json.loads(json_str), pos + 1
-                except json.JSONDecodeError as e:
-                    # 尝试修复常见问题
-                    try:
-                        # 1. 移除尾随逗号
-                        import re
-                        fixed = re.sub(r',\s*}', '}', json_str)
-                        fixed = re.sub(r',\s*]', ']', fixed)
-                        return json.loads(fixed), pos + 1
-                    except json.JSONDecodeError:
-                        pass
-
-                    try:
-                        # 2. 转义字符串内的控制字符（处理未转义的换行符）
-                        fixed = escape_json_string_newlines(json_str)
-                        return json.loads(fixed), pos + 1
-                    except json.JSONDecodeError:
-                        pass
-
-                    try:
-                        # 3. 组合修复：先转义控制字符，再移除尾随逗号
-                        fixed = escape_json_string_newlines(json_str)
-                        fixed = re.sub(r',\s*}', '}', fixed)
-                        fixed = re.sub(r',\s*]', ']', fixed)
-                        return json.loads(fixed), pos + 1
-                    except json.JSONDecodeError:
-                        raise e
+                return _try_parse_json(json_str, pos + 1)
 
         pos += 1
+
+    # JSON 不完整 - 尝试智能修复
+    incomplete_json = text[json_start:]
+
+    # 策略 1: 尝试强制闭合 JSON
+    if depth > 0:
+        # 计算需要闭合的括号
+        close_brackets = '}' * depth
+
+        # 检查是否在字符串内部（未闭合的引号）
+        if in_string:
+            # 尝试闭合字符串
+            incomplete_json = incomplete_json + '"' + close_brackets
+        else:
+            incomplete_json = incomplete_json + close_brackets
+
+        try:
+            result = _try_parse_json(incomplete_json, len(text))
+            logger.warning(f"JSON was incomplete (depth={depth}), auto-closed successfully")
+            return result
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    # 策略 2: 查找最后一个有效的 JSON 结束点
+    # 从后向前查找最后一个 '}' 并尝试解析
+    search_text = text[json_start:]
+    for i in range(len(search_text) - 1, 0, -1):
+        if search_text[i] == '}':
+            try_json = search_text[:i + 1]
+            try:
+                result = _try_parse_json(try_json, json_start + i + 1)
+                logger.warning(f"JSON was truncated, found valid endpoint at position {i}")
+                return result
+            except (json.JSONDecodeError, ValueError):
+                continue
 
     raise ValueError("Incomplete JSON object - no matching '}'")
 
@@ -985,7 +1462,7 @@ def parse_inline_tool_calls(text: str) -> tuple[list, str]:
                 continue
 
             except (ValueError, json.JSONDecodeError) as e:
-                # JSON 解析失败，尝试更简单的提取
+                # JSON 解析失败，尝试更智能的提取
                 logger.warning(f"JSON parse failed for tool {tool_name}: {e}")
 
                 # 尝试提取到下一个 [Calling tool: 或文本结尾
@@ -995,13 +1472,30 @@ def parse_inline_tool_calls(text: str) -> tuple[list, str]:
                 else:
                     json_text = after_match[input_match.end():].strip()
 
-                # 尝试解析
+                # 尝试多种方式解析
+                parsed_input = None
+                actual_end_pos = None
+
                 if json_text.startswith('{'):
+                    # 方法 1: 使用改进的括号计数（考虑字符串）
                     try:
-                        # 找到最后一个 }
                         brace_count = 0
+                        in_str = False
+                        esc = False
                         end_pos = 0
+
                         for i, c in enumerate(json_text):
+                            if esc:
+                                esc = False
+                                continue
+                            if c == '\\' and in_str:
+                                esc = True
+                                continue
+                            if c == '"' and not esc:
+                                in_str = not in_str
+                                continue
+                            if in_str:
+                                continue
                             if c == '{':
                                 brace_count += 1
                             elif c == '}':
@@ -1011,29 +1505,92 @@ def parse_inline_tool_calls(text: str) -> tuple[list, str]:
                                     break
 
                         if end_pos > 0:
-                            input_json = json.loads(json_text[:end_pos])
-                            tool_id = f"toolu_{uuid.uuid4().hex[:12]}"
-                            tool_uses.append({
-                                "type": "tool_use",
-                                "id": tool_id,
-                                "name": tool_name,
-                                "input": input_json
-                            })
-                            last_end = match_end + input_match.end() + end_pos
-                            pos = last_end
-                            continue
-                    except:
-                        pass
+                            try:
+                                parsed_input = json.loads(json_text[:end_pos])
+                                actual_end_pos = match_end + input_match.end() + end_pos
+                            except json.JSONDecodeError:
+                                # 尝试修复
+                                try:
+                                    parsed_input = _try_parse_json(json_text[:end_pos], 0)[0]
+                                    actual_end_pos = match_end + input_match.end() + end_pos
+                                except:
+                                    pass
+                    except Exception as ex:
+                        logger.debug(f"Bracket counting failed: {ex}")
 
-                # 如果还是失败，作为 raw_input 处理
+                    # 方法 2: 如果方法1失败，尝试强制闭合
+                    if parsed_input is None and brace_count > 0:
+                        try:
+                            forced_close = json_text + '}' * brace_count
+                            parsed_input = _try_parse_json(forced_close, 0)[0]
+                            actual_end_pos = match_end + input_match.end() + len(json_text)
+                            logger.info(f"Tool {tool_name}: JSON force-closed with {brace_count} braces")
+                        except:
+                            pass
+
+                    # 方法 3: 从后向前找有效的 JSON
+                    if parsed_input is None:
+                        for i in range(len(json_text) - 1, 0, -1):
+                            if json_text[i] == '}':
+                                try:
+                                    parsed_input = _try_parse_json(json_text[:i + 1], 0)[0]
+                                    actual_end_pos = match_end + input_match.end() + i + 1
+                                    logger.info(f"Tool {tool_name}: Found valid JSON endpoint at {i}")
+                                    break
+                                except:
+                                    continue
+
+                if parsed_input is not None:
+                    tool_id = f"toolu_{uuid.uuid4().hex[:12]}"
+                    tool_uses.append({
+                        "type": "tool_use",
+                        "id": tool_id,
+                        "name": tool_name,
+                        "input": parsed_input
+                    })
+                    last_end = actual_end_pos
+                    pos = actual_end_pos
+                    continue
+
+                # 如果所有方法都失败，作为 raw_input 处理（保留更多信息用于调试）
+                logger.warning(f"Tool {tool_name}: All JSON parse attempts failed, using raw input")
                 tool_id = f"toolu_{uuid.uuid4().hex[:12]}"
+
+                # 尝试提取有意义的部分
+                raw_content = json_text[:2000] if json_text else ""
+
+                # 检查是否是特定工具（如 Write），尝试提取关键参数
+                if tool_name in ["Write", "Edit"] and "file_path" in raw_content:
+                    # 尝试提取 file_path
+                    fp_match = re.search(r'"file_path"\s*:\s*"([^"]*)"', raw_content)
+                    if fp_match:
+                        tool_uses.append({
+                            "type": "tool_use",
+                            "id": tool_id,
+                            "name": tool_name,
+                            "input": {
+                                "file_path": fp_match.group(1),
+                                "_parse_error": "JSON incomplete, extracted file_path only",
+                                "_raw_preview": raw_content[:500]
+                            }
+                        })
+                        if next_tool:
+                            last_end = match_end + input_match.end() + next_tool.start()
+                        else:
+                            last_end = len(text)
+                        pos = last_end
+                        continue
+
                 tool_uses.append({
                     "type": "tool_use",
                     "id": tool_id,
                     "name": tool_name,
-                    "input": {"_raw": json_text[:500] if json_text else ""}
+                    "input": {"_raw": raw_content, "_parse_error": str(e)}
                 })
-                last_end = match_end + (input_match.end() if input_match else 0)
+                if next_tool:
+                    last_end = match_end + input_match.end() + next_tool.start()
+                else:
+                    last_end = len(text)
                 pos = last_end
                 continue
         else:
@@ -1242,9 +1799,23 @@ async def anthropic_messages(request: Request):
     except json.JSONDecodeError:
         raise HTTPException(400, "Invalid JSON")
 
-    model = body.get("model", "claude-sonnet-4")
+    original_model = body.get("model", "claude-sonnet-4")
     stream = body.get("stream", False)
     orig_msg_count = len(body.get("messages", []))
+
+    # ==================== 智能模型路由 ====================
+    # 对 Opus 请求进行智能降级判断
+    routed_model, route_reason = model_router.route(body)
+
+    if routed_model != original_model:
+        logger.info(f"[{request_id}] 🔀 模型路由: {original_model} -> {routed_model} ({route_reason})")
+        # 更新请求中的模型
+        body["model"] = routed_model
+        model = routed_model
+    else:
+        model = original_model
+        if "opus" in original_model.lower():
+            logger.info(f"[{request_id}] ✅ 保留 Opus: {route_reason}")
 
     # 使用完整转换（包含截断和空消息过滤）
     openai_body = convert_anthropic_to_openai(body)
@@ -1273,9 +1844,15 @@ async def anthropic_messages(request: Request):
     except:
         pass
 
+    # 构建请求头 - 添加唯一标识让 tokens 区分不同请求
+    # 关键：每个请求使用不同的 X-Request-ID 和 X-Trace-ID
+    # 这样 tokens 不会把多个请求当作同一终端处理
     headers = {
         "Authorization": f"Bearer {KIRO_API_KEY}",
         "Content-Type": "application/json",
+        "X-Request-ID": f"req_{request_id}_{uuid.uuid4().hex[:8]}",
+        "X-Trace-ID": f"trace_{uuid.uuid4().hex}",
+        "X-Client-ID": f"client_{uuid.uuid4().hex[:12]}",  # 模拟不同客户端
     }
 
     if stream:
@@ -1621,9 +2198,13 @@ async def chat_completions(request: Request):
         if key in body and body[key] is not None:
             kiro_request[key] = body[key]
 
+    # 添加唯一请求标识
     headers = {
         "Authorization": f"Bearer {KIRO_API_KEY}",
         "Content-Type": "application/json",
+        "X-Request-ID": f"chat_{request_id}_{uuid.uuid4().hex[:8]}",
+        "X-Trace-ID": f"trace_{uuid.uuid4().hex}",
+        "X-Client-ID": f"client_{uuid.uuid4().hex[:12]}",  # 模拟不同客户端
     }
 
     if stream:
