@@ -68,6 +68,7 @@ REQUEST_TIMEOUT = 300
 # 1. Opus 用于真正需要深度推理的关键时刻（创建、设计、架构）
 # 2. Sonnet 用于执行性任务（工具调用、简单修改）
 # 3. 保证 10-20% 的 Opus 使用比例
+# 4. Extended Thinking 和 Agent 调用场景使用 Opus
 MODEL_ROUTING_CONFIG = {
     # 启用智能路由
     "enabled": True,
@@ -77,69 +78,80 @@ MODEL_ROUTING_CONFIG = {
     "sonnet_model": "claude-sonnet-4-5-20250929",
 
     # ============================================================
+    # 第零优先级：强制 Opus 的场景（不受其他条件影响）
+    # ============================================================
+    # Extended Thinking 请求 - 必须使用 Opus
+    "force_opus_on_thinking": True,
+
+    # 主 Agent 请求（非子 Agent）- 更高概率用 Opus
+    "main_agent_opus_probability": 60,  # 主 Agent 60% 概率用 Opus
+
+    # ============================================================
     # 第一优先级：强制 Opus 的关键词（最后一条用户消息包含）
-    # 这些是真正需要深度思考的任务 - 收紧列表
+    # 这些是真正需要深度思考的任务
     # ============================================================
     "force_opus_keywords": [
-        # 创建类 - 只有完整的创建任务
+        # 创建类 - 完整的创建任务
         "创建项目", "新建项目", "初始化项目", "搭建项目",
         "create project", "new project", "init project",
         # 设计架构类 - 需要架构思维
-        "设计架构", "系统设计", "架构设计", "方案设计",
-        "design architecture", "system design", "architecture design",
+        "设计架构", "系统设计", "架构设计", "方案设计", "设计",
+        "design architecture", "system design", "architecture design", "design",
         # 深度分析类
-        "深度分析", "全面分析", "详细分析", "根因分析",
-        "deep analysis", "comprehensive analysis", "root cause",
+        "分析", "梳理", "检查问题", "全面分析", "详细分析", "根因分析", "诊断",
+        "analysis", "analyze", "diagnose", "investigate",
         # 重构类 - 大规模重构
-        "全面重构", "整体重构", "大规模重构",
-        "full refactor", "major refactor", "complete refactor",
-        # 复杂规划
-        "整体规划", "系统规划", "战略规划",
-        "overall plan", "strategic plan",
+        "重构", "整体重构", "大规模重构",
+        "refactor", "major refactor", "complete refactor",
+        # 规划类
+        "规划", "整体规划", "系统规划", "战略规划", "计划",
+        "plan", "planning", "strategy",
+        # Agent/Task 调用相关
+        "UI-UX", "ui-ux", "UI设计", "设计稿",
     ],
 
     # ============================================================
-    # 第二优先级：强制 Sonnet 的关键词（执行性任务）- 扩展列表
+    # 第二优先级：强制 Sonnet 的关键词（执行性任务）
     # ============================================================
     "force_sonnet_keywords": [
         # 简单操作
-        "看看", "检查", "查看", "显示", "列出", "打开",
-        "check", "show", "list", "display", "view", "open",
+        "看看", "显示", "列出", "打开",
+        "show", "list", "display", "view", "open",
         # 小改动
-        "修复", "修改", "调整", "更新", "改一下", "改成",
-        "fix", "modify", "adjust", "update", "change",
+        "修复", "调整", "更新", "改一下", "改成",
+        "fix", "adjust", "update",
         # 执行命令
-        "运行", "执行", "测试", "启动", "重启", "停止",
-        "run", "execute", "test", "start", "restart", "stop",
+        "运行", "执行", "启动", "重启", "停止",
+        "run", "execute", "start", "restart", "stop",
         # 简单问答
-        "什么是", "怎么", "哪里", "是不是", "有没有",
-        "what is", "how to", "where", "is it", "do you",
+        "什么是", "哪里", "是不是", "有没有",
+        "what is", "where", "is it", "do you",
         # 读取类
-        "读取", "获取", "查询", "搜索",
-        "read", "get", "query", "search", "find",
+        "读取", "获取", "搜索",
+        "read", "get", "search", "find",
         # 安装类
-        "安装", "下载", "添加依赖",
-        "install", "download", "add dependency",
+        "安装", "下载",
+        "install", "download",
     ],
 
     # ============================================================
     # 第三优先级：基于对话阶段的智能判断
     # ============================================================
 
-    # 首轮对话检测 - 新任务开始需要一定概率 Opus（但控制比例）
-    "first_turn_opus_probability": 25,    # 首轮 25% 概率用 Opus（进一步降低）
+    # 首轮对话检测 - 新任务开始需要一定概率 Opus
+    "first_turn_opus_probability": 90,    # 首轮 50% 概率用 Opus
 
     # 用户消息数阈值（不含 system）- 判断是否为首轮
     "first_turn_max_user_messages": 2,    # <= 2 条用户消息视为首轮
 
     # 工具执行阶段检测 - 大量工具调用说明在执行阶段
-    "execution_phase_tool_calls": 3,      # 工具调用 >= 3 次视为执行阶段
-    "execution_phase_sonnet_probability": 95,  # 执行阶段 95% 用 Sonnet
+    "execution_phase_tool_calls": 5,      # 工具调用 >= 5 次视为执行阶段
+    "execution_phase_sonnet_probability": 80,  # 执行阶段 90% 用 Sonnet
 
     # ============================================================
     # 第四优先级：保底概率（确保 10-20% Opus 使用率）
     # ============================================================
-    "base_opus_probability": 10,          # 基础 10% 概率使用 Opus（降低）
+    "base_opus_probability": 30,          # 基础 15% 概率使用 Opus
 
     # ============================================================
     # 调试和监控
@@ -237,14 +249,52 @@ class ModelRouter:
         hash_val = int(hashlib.md5(seed.encode()).hexdigest()[:8], 16)
         return (hash_val % 100) < threshold
 
+    def _is_sub_agent_request(self, messages: list) -> bool:
+        """检测是否为子 Agent 请求"""
+        # 子 Agent 的 system prompt 通常包含这些特征
+        if not messages:
+            return False
+        first_msg = messages[0]
+        if first_msg.get("role") != "system":
+            return False
+        content = first_msg.get("content", "")
+        # 子 Agent 特征
+        sub_agent_markers = [
+            "command execution specialist",
+            "exploring codebase",
+            "specialized agent",
+            "bash commands efficiently",
+            "research task",
+        ]
+        content_lower = content.lower()
+        return any(marker in content_lower for marker in sub_agent_markers)
+
+    def _has_thinking_request(self, request_body: dict) -> bool:
+        """检测是否为 Extended Thinking 请求"""
+        # 检查是否有 thinking 相关参数
+        if "thinking" in request_body:
+            return True
+        if "budget_tokens" in request_body:
+            return True
+        # 检查消息中是否有 thinking content
+        for msg in request_body.get("messages", []):
+            content = msg.get("content", [])
+            if isinstance(content, list):
+                for item in content:
+                    if isinstance(item, dict) and item.get("type") == "thinking":
+                        return True
+        return False
+
     def should_use_opus(self, request_body: dict) -> tuple[bool, str]:
         """
         智能判断是否应该使用 Opus
 
         决策优先级：
+        0. Extended Thinking 请求 → 强制 Opus
+        0b. 主 Agent 请求 → 高概率 Opus
         1. 强制 Opus 关键词 → Opus
         2. 强制 Sonnet 关键词 → Sonnet
-        3. 首轮对话（新任务）→ 高概率 Opus
+        3. 首轮对话（新任务）→ 概率 Opus
         4. 执行阶段（大量工具调用）→ 高概率 Sonnet
         5. 保底概率 → 确保 ~15% Opus
 
@@ -259,6 +309,24 @@ class ModelRouter:
 
         # 生成稳定的哈希种子（相同请求得到相同结果）
         hash_seed = f"{len(messages)}:{last_user_msg[:200]}"
+
+        # ============================================================
+        # 第零优先级：特殊场景强制 Opus
+        # ============================================================
+
+        # 0a. Extended Thinking 请求 - 必须使用 Opus
+        if self.config.get("force_opus_on_thinking", True) and self._has_thinking_request(request_body):
+            return True, "ExtendedThinking"
+
+        # 0b. 主 Agent 请求（非子 Agent）- 更高概率用 Opus
+        is_sub_agent = self._is_sub_agent_request(messages)
+        if not is_sub_agent:
+            main_agent_prob = self.config.get("main_agent_opus_probability", 60)
+            # 只在首轮（新任务开始）时应用主 Agent 概率
+            user_msg_count = self._count_user_messages(messages)
+            if user_msg_count <= 2:
+                if self._get_hash_probability(hash_seed + ":main", main_agent_prob):
+                    return True, f"主Agent首轮({main_agent_prob}%)"
 
         # ============================================================
         # 第一优先级：强制 Opus 关键词
@@ -286,7 +354,7 @@ class ModelRouter:
         # 3a. 首轮对话检测 - 新任务开始更需要 Opus
         first_turn_max = self.config.get("first_turn_max_user_messages", 2)
         if user_msg_count <= first_turn_max:
-            first_turn_prob = self.config.get("first_turn_opus_probability", 70)
+            first_turn_prob = self.config.get("first_turn_opus_probability", 50)
             if self._get_hash_probability(hash_seed + ":first", first_turn_prob):
                 return True, f"首轮对话({user_msg_count}条,{first_turn_prob}%)"
             else:
@@ -357,8 +425,8 @@ model_router = ModelRouter(MODEL_ROUTING_CONFIG)
 # HTTP 连接池配置 - 针对高并发优化
 # 关键：禁用 HTTP/2，使用 HTTP/1.1 多连接模式
 # 原因：HTTP/2 多路复用会让所有请求走同一连接，tokens 可能误认为是同一终端
-HTTP_POOL_MAX_CONNECTIONS = 500       # 最大并发连接数
-HTTP_POOL_MAX_KEEPALIVE = 100         # 保持活跃的连接数
+HTTP_POOL_MAX_CONNECTIONS = 1000       # 最大并发连接数
+HTTP_POOL_MAX_KEEPALIVE = 200         # 保持活跃的连接数
 HTTP_POOL_KEEPALIVE_EXPIRY = 30       # 连接保持时间(秒)
 HTTP_USE_HTTP2 = False                # 禁用 HTTP/2，使用 HTTP/1.1 多连接
 
@@ -1803,6 +1871,22 @@ async def anthropic_messages(request: Request):
     stream = body.get("stream", False)
     orig_msg_count = len(body.get("messages", []))
 
+    # ==================== max_tokens 处理 ====================
+    # 确保有合理的 max_tokens，防止响应被意外截断
+    DEFAULT_MAX_TOKENS = 16384  # 16K tokens 作为默认值
+    MAX_ALLOWED_TOKENS = 64000  # 64K tokens 上限
+
+    original_max_tokens = body.get("max_tokens")
+    if original_max_tokens is None:
+        body["max_tokens"] = DEFAULT_MAX_TOKENS
+        logger.info(f"[{request_id}] 设置默认 max_tokens: {DEFAULT_MAX_TOKENS}")
+    elif original_max_tokens < 1000:
+        # 如果设置得太小，可能导致截断
+        logger.warning(f"[{request_id}] max_tokens 较小 ({original_max_tokens})，可能导致响应截断")
+
+    # 记录 max_tokens 以便调试
+    final_max_tokens = body.get("max_tokens")
+
     # ==================== 智能模型路由 ====================
     # 对 Opus 请求进行智能降级判断
     routed_model, route_reason = model_router.route(body)
@@ -1824,7 +1908,7 @@ async def anthropic_messages(request: Request):
     total_chars = sum(len(str(m.get("content", ""))) for m in openai_body.get("messages", []))
 
     logger.info(f"[{request_id}] Anthropic -> OpenAI: model={model}, stream={stream}, "
-                f"msgs={orig_msg_count}->{final_msg_count}, chars={total_chars}")
+                f"msgs={orig_msg_count}->{final_msg_count}, chars={total_chars}, max_tokens={final_max_tokens}")
 
     # 保存调试文件（仅保留最近几个）
     debug_dir = "/tmp/ai-history-debug"
@@ -1940,65 +2024,137 @@ async def handle_anthropic_stream_via_openai(
                 # Token 计数：从 OpenAI 响应获取
                 input_tokens = estimated_input_tokens  # 默认使用估算值
                 output_tokens = 0
+                stream_completed = False  # 标记流是否正常完成
+                received_done = False     # 是否收到 [DONE] 信号
 
-                async for chunk in response.aiter_text():
-                    buffer += chunk
-                    while "\n" in buffer:
-                        line, buffer = buffer.split("\n", 1)
-                        line = line.strip()
-                        if not line or not line.startswith("data:"):
-                            continue
+                try:
+                    async for chunk in response.aiter_text():
+                        buffer += chunk
+                        while "\n" in buffer:
+                            line, buffer = buffer.split("\n", 1)
+                            line = line.strip()
+                            if not line or not line.startswith("data:"):
+                                continue
 
-                        data_str = line[5:].strip()
-                        if data_str == "[DONE]":
-                            continue
+                            data_str = line[5:].strip()
+                            if data_str == "[DONE]":
+                                received_done = True
+                                stream_completed = True
+                                continue
 
-                        try:
-                            data = json.loads(data_str)
+                            try:
+                                data = json.loads(data_str)
 
-                            # 捕获 OpenAI usage 信息（stream_options: include_usage）
-                            usage = data.get("usage")
-                            if usage:
-                                input_tokens = usage.get("prompt_tokens", input_tokens)
-                                output_tokens = usage.get("completion_tokens", output_tokens)
+                                # 捕获 OpenAI usage 信息（stream_options: include_usage）
+                                usage = data.get("usage")
+                                if usage:
+                                    input_tokens = usage.get("prompt_tokens", input_tokens)
+                                    output_tokens = usage.get("completion_tokens", output_tokens)
 
-                            choice = data.get("choices", [{}])[0]
-                            delta = choice.get("delta", {})
-                            fr = choice.get("finish_reason")
-                            if fr:
-                                if fr == "tool_calls":
-                                    finish_reason = "tool_use"
-                                elif fr == "length":
-                                    finish_reason = "max_tokens"
+                                choice = data.get("choices", [{}])[0]
+                                delta = choice.get("delta", {})
+                                fr = choice.get("finish_reason")
+                                if fr:
+                                    stream_completed = True  # 有 finish_reason 表示正常结束
+                                    if fr == "tool_calls":
+                                        finish_reason = "tool_use"
+                                    elif fr == "length":
+                                        finish_reason = "max_tokens"
+                                    elif fr == "stop":
+                                        finish_reason = "end_turn"
 
-                            # 累积文本
-                            content = delta.get("content", "")
-                            if content:
-                                full_text += content
+                                # 累积文本
+                                content = delta.get("content", "")
+                                if content:
+                                    full_text += content
 
-                            # 处理 OpenAI 原生 tool_calls（如果有）
-                            tool_calls = delta.get("tool_calls", [])
-                            for tc in tool_calls:
-                                tc_index = tc.get("index", 0)
-                                tc_id = tc.get("id")
-                                tc_func = tc.get("function", {})
+                                # 处理 OpenAI 原生 tool_calls（如果有）
+                                tool_calls = delta.get("tool_calls", [])
+                                for tc in tool_calls:
+                                    tc_index = tc.get("index", 0)
+                                    tc_id = tc.get("id")
+                                    tc_func = tc.get("function", {})
 
-                                if tc_id:
-                                    has_openai_tool_calls = True
-                                    openai_tool_calls[tc_index] = {
-                                        "id": tc_id,
-                                        "name": tc_func.get("name", ""),
-                                        "arguments": ""
-                                    }
+                                    if tc_id:
+                                        has_openai_tool_calls = True
+                                        openai_tool_calls[tc_index] = {
+                                            "id": tc_id,
+                                            "name": tc_func.get("name", ""),
+                                            "arguments": ""
+                                        }
 
-                                if tc_index in openai_tool_calls and tc_func.get("arguments"):
-                                    openai_tool_calls[tc_index]["arguments"] += tc_func["arguments"]
+                                    if tc_index in openai_tool_calls and tc_func.get("arguments"):
+                                        openai_tool_calls[tc_index]["arguments"] += tc_func["arguments"]
 
-                        except json.JSONDecodeError:
-                            pass
+                            except json.JSONDecodeError:
+                                pass
+
+                except (httpx.RemoteProtocolError, httpx.ReadError) as stream_error:
+                    # EOF / 连接中断错误
+                    logger.error(f"[{request_id}] ⚠️ 流被中断 (EOF): {type(stream_error).__name__}: {stream_error}")
+                    stream_completed = False
+
+                # 检测响应是否被截断（常见截断标志）
+                is_truncated = False
+                truncation_reason = None
+
+                # 检测0: 流未正常完成（EOF/连接中断）
+                if not stream_completed:
+                    is_truncated = True
+                    truncation_reason = "stream_interrupted (EOF)"
+                    logger.warning(f"[{request_id}] 流未正常完成: received_done={received_done}, text_len={len(full_text)}")
+
+                # 检测1: finish_reason 是 max_tokens 或 length
+                if finish_reason in ("max_tokens", "length"):
+                    is_truncated = True
+                    truncation_reason = "max_tokens_reached"
+                    logger.warning(f"[{request_id}] 响应被截断: finish_reason={finish_reason}")
+
+                # 检测2: 检查工具调用 JSON 是否完整（括号匹配）
+                if not is_truncated and "[Calling tool:" in full_text:
+                    open_braces = full_text.count('{')
+                    close_braces = full_text.count('}')
+                    if open_braces > close_braces:
+                        is_truncated = True
+                        truncation_reason = f"incomplete_json (braces: {open_braces} open, {close_braces} close)"
+                        logger.warning(f"[{request_id}] 检测到不完整 JSON: {truncation_reason}")
 
                 # 解析内联工具调用
                 tool_uses, remaining_text = parse_inline_tool_calls(full_text)
+
+                # 检测3: 解析后检查是否有 _parse_error 或 _raw
+                has_parse_errors = False
+                for tu in tool_uses:
+                    if isinstance(tu.get("input"), dict):
+                        if "_parse_error" in tu["input"] or "_raw" in tu["input"]:
+                            has_parse_errors = True
+                            is_truncated = True
+                            truncation_reason = f"tool_parse_error in {tu.get('name', 'unknown')}"
+                            logger.warning(f"[{request_id}] 工具调用解析失败: {tu.get('name')}")
+                            break
+
+                # 如果检测到截断且有工具调用，尝试恢复
+                if is_truncated and tool_uses:
+                    # 过滤掉解析失败的工具调用
+                    valid_tools = []
+                    for tu in tool_uses:
+                        inp = tu.get("input", {})
+                        if isinstance(inp, dict) and ("_parse_error" not in inp and "_raw" not in inp):
+                            valid_tools.append(tu)
+                        else:
+                            # 记录失败的工具调用
+                            logger.warning(f"[{request_id}] 丢弃无效工具调用: {tu.get('name')} - {inp.get('_parse_error', 'unknown error')[:100]}")
+
+                    if valid_tools:
+                        tool_uses = valid_tools
+                        logger.info(f"[{request_id}] 恢复 {len(valid_tools)} 个有效工具调用")
+                    else:
+                        # 所有工具调用都失败，作为纯文本返回
+                        tool_uses = []
+                        remaining_text = full_text
+                        logger.warning(f"[{request_id}] 所有工具调用解析失败，回退为纯文本响应")
+                        # 添加截断警告到响应
+                        remaining_text += f"\n\n[⚠️ Response truncated: {truncation_reason}]"
 
                 # 添加 OpenAI 原生工具调用
                 for tc_data in openai_tool_calls.values():
@@ -2045,9 +2201,16 @@ async def handle_anthropic_stream_via_openai(
                         }
                         yield f"data: {json.dumps(tool_start)}\n\n".encode()
 
-                        # input_json_delta
-                        input_json = json.dumps(tool_use["input"])
-                        yield f'data: {{"type":"content_block_delta","index":{block_index},"delta":{{"type":"input_json_delta","partial_json":{json.dumps(input_json)}}}}}\n\n'.encode()
+                        # input_json_delta - 构建完整的 delta 对象避免双重编码
+                        delta_event = {
+                            "type": "content_block_delta",
+                            "index": block_index,
+                            "delta": {
+                                "type": "input_json_delta",
+                                "partial_json": json.dumps(tool_use["input"])
+                            }
+                        }
+                        yield f"data: {json.dumps(delta_event)}\n\n".encode()
 
                         # content_block_stop
                         yield f'data: {{"type":"content_block_stop","index":{block_index}}}\n\n'.encode()
@@ -2056,6 +2219,12 @@ async def handle_anthropic_stream_via_openai(
                 # 如果 OpenAI 没有返回 usage，使用估算值
                 if output_tokens == 0:
                     output_tokens = estimate_tokens(full_text)
+
+                # 如果检测到截断，记录详细信息
+                if is_truncated:
+                    logger.warning(f"[{request_id}] ⚠️ 响应截断完成: reason={truncation_reason}, "
+                                   f"text_len={len(full_text)}, tools={len(tool_uses)}, "
+                                   f"finish_reason={finish_reason}")
 
                 # message delta with token usage
                 yield f'data: {{"type":"message_delta","delta":{{"stop_reason":"{finish_reason}","stop_sequence":null}},"usage":{{"output_tokens":{output_tokens}}}}}\n\n'.encode()
@@ -2070,8 +2239,16 @@ async def handle_anthropic_stream_via_openai(
                 "error": {"type": "timeout_error", "message": "Request timeout"}
             }
             yield f"data: {json.dumps(error_response)}\n\n".encode()
+        except (httpx.RemoteProtocolError, httpx.ReadError) as e:
+            # EOF / 连接中断 - 这是常见的上游错误
+            logger.error(f"[{request_id}] 连接中断 (EOF): {type(e).__name__}: {e}")
+            error_response = {
+                "type": "error",
+                "error": {"type": "stream_error", "message": f"Connection interrupted: {type(e).__name__}. Please retry."}
+            }
+            yield f"data: {json.dumps(error_response)}\n\n".encode()
         except Exception as e:
-            logger.error(f"[{request_id}] 请求异常: {e}")
+            logger.error(f"[{request_id}] 请求异常: {type(e).__name__}: {e}")
             error_response = {
                 "type": "error",
                 "error": {"type": "api_error", "message": str(e)}
