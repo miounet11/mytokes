@@ -97,6 +97,121 @@ HISTORY_CONFIG = HistoryConfig(
 )
 ```
 
+### 3. 智能模型路由配置 (重要)
+
+位置：`api_server.py` 第 68-164 行
+
+```python
+MODEL_ROUTING_CONFIG = {
+    # 启用智能路由
+    "enabled": True,
+
+    # 目标模型映射
+    "opus_model": "claude-opus-4-5-20251101",
+    "sonnet_model": "claude-sonnet-4-5-20250929",
+
+    # ============================================================
+    # 第零优先级：强制 Opus 的场景
+    # ============================================================
+    "force_opus_on_thinking": True,        # Extended Thinking → Opus
+    "main_agent_opus_probability": 60,     # 主 Agent 60% 概率用 Opus
+
+    # ============================================================
+    # 第一优先级：强制 Opus 的关键词
+    # ============================================================
+    "force_opus_keywords": [
+        # 创建类
+        "创建项目", "新建项目", "初始化项目",
+        # 设计架构类
+        "设计架构", "系统设计", "架构设计", "设计",
+        # 深度分析类
+        "分析", "梳理", "检查问题", "诊断",
+        # 重构类
+        "重构", "整体重构",
+        # 规划类
+        "规划", "计划",
+    ],
+
+    # ============================================================
+    # 第二优先级：强制 Sonnet 的关键词
+    # ============================================================
+    "force_sonnet_keywords": [
+        # 简单操作
+        "看看", "显示", "列出", "打开",
+        # 小改动
+        "修复", "调整", "更新",
+        # 执行命令
+        "运行", "执行", "启动", "重启",
+        # 简单问答
+        "什么是", "哪里", "是不是",
+        # 读取类
+        "读取", "获取", "搜索",
+    ],
+
+    # ============================================================
+    # 第三优先级：对话阶段判断
+    # ============================================================
+    "first_turn_opus_probability": 90,     # 首轮 90% 概率用 Opus
+    "first_turn_max_user_messages": 2,     # ≤2 条用户消息视为首轮
+    "execution_phase_tool_calls": 5,       # ≥5 次工具调用视为执行阶段
+    "execution_phase_sonnet_probability": 80,  # 执行阶段 80% 用 Sonnet
+
+    # ============================================================
+    # 第四优先级：保底概率
+    # ============================================================
+    "base_opus_probability": 30,           # 基础 30% 概率使用 Opus
+
+    # 调试
+    "log_routing_decision": True,
+}
+```
+
+#### 路由决策逻辑
+
+```
+请求进入 → 是否 Opus 请求？
+    ↓ 是
+优先级 0: Extended Thinking? → 强制 Opus
+    ↓ 否
+优先级 0b: 主 Agent 首轮? → 60% 概率 Opus
+    ↓ 否
+优先级 1: 包含 Opus 关键词? → 强制 Opus
+    ↓ 否
+优先级 2: 包含 Sonnet 关键词? → 强制 Sonnet
+    ↓ 否
+优先级 3a: 首轮对话 (≤2条消息)? → 90% Opus
+    ↓ 否
+优先级 3b: 执行阶段 (≥5次工具)? → 80% Sonnet
+    ↓ 否
+优先级 4: 保底概率 → 30% Opus, 70% Sonnet
+```
+
+#### 调优指南
+
+**增加 Opus 使用率（提升质量）：**
+- 提高 `first_turn_opus_probability` (90 → 95)
+- 提高 `main_agent_opus_probability` (60 → 80)
+- 提高 `base_opus_probability` (30 → 50)
+- 添加更多关键词到 `force_opus_keywords`
+
+**减少 Opus 使用率（节省成本）：**
+- 降低上述概率值
+- 添加更多关键词到 `force_sonnet_keywords`
+- 设置 `enabled: False` 完全禁用路由
+
+#### 监控路由
+
+```bash
+# 查看路由统计
+curl http://127.0.0.1:8100/admin/routing/stats
+
+# 重置统计
+curl -X POST http://127.0.0.1:8100/admin/routing/reset
+
+# 实时查看路由日志
+tail -f /var/log/ai-history-manager.log | grep "模型路由"
+```
+
 ### 3. 策略说明
 
 | 策略 | 说明 | 触发条件 |
@@ -311,9 +426,56 @@ claude config set apiBaseUrl "http://your-server:8100"
 
 **解决方案**：`escape_json_string_newlines()` 函数自动处理
 
+### 4. 服务启动失败 - "Address already in use"
+
+**原因**：端口 8100 被占用（旧进程未完全退出）
+
+**解决方案**：
+```bash
+# 强制杀死所有相关进程
+pkill -9 -f "uvicorn api_server:app"
+sleep 2
+bash start.sh
+```
+
+### 5. 健康检查失败
+
+**原因**：服务正在启动中，或启动失败
+
+**解决方案**：
+```bash
+# 等待几秒后重试
+sleep 3
+curl http://127.0.0.1:8100/
+
+# 如果仍然失败，查看日志
+tail -30 /var/log/ai-history-manager.log
+```
+
+### 6. 模型路由不生效
+
+**原因**：路由配置可能被禁用或参数设置不当
+
+**解决方案**：
+```bash
+# 检查路由状态
+curl http://127.0.0.1:8100/admin/routing/stats
+
+# 确认 api_server.py 中 MODEL_ROUTING_CONFIG["enabled"] = True
+```
+
 ---
 
 ## 更新日志
+
+### 2026-01-29 (v3)
+
+- **智能模型路由**：新增 Opus/Sonnet 智能路由功能
+  - Extended Thinking 请求强制使用 Opus
+  - 基于关键词和对话阶段的智能判断
+  - 可配置的概率控制
+- **路由监控**：新增 `/admin/routing/stats` 端点查看路由统计
+- **参数调优**：优化历史管理参数，减少上下文长度
 
 ### 2026-01-28 (v2)
 

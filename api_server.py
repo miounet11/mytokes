@@ -37,6 +37,54 @@ KIRO_PROXY_URL = f"{KIRO_PROXY_BASE}/kiro/v1/chat/completions"
 KIRO_MODELS_URL = f"{KIRO_PROXY_BASE}/kiro/v1/models"
 KIRO_API_KEY = "dba22273-65d3-4dc1-8ce9-182f680b2bf5"
 
+# ==================== 智能接续配置 ====================
+
+# 接续机制配置 - 处理上游截断响应
+CONTINUATION_CONFIG = {
+    # 启用接续机制
+    "enabled": True,
+
+    # 最大续传次数（防止无限循环）
+    "max_continuations": 3,
+
+    # 触发续传的条件
+    "triggers": {
+        # 流中断（EOF/连接断开）
+        "stream_interrupted": True,
+        # max_tokens 达到上限
+        "max_tokens_reached": True,
+        # 工具调用 JSON 不完整
+        "incomplete_tool_json": True,
+        # 解析错误
+        "parse_error": True,
+    },
+
+    # 续传提示词模板
+    "continuation_prompt": """Your previous response was truncated. Please continue EXACTLY from where you stopped.
+
+IMPORTANT:
+- Do NOT repeat any content you already generated
+- Do NOT add any preamble or explanation
+- Continue the JSON/tool call from the exact character where it was cut off
+- If you were in the middle of a tool call, complete it properly
+
+Your truncated response ended with:
+```
+{truncated_ending}
+```
+
+Continue from here:""",
+
+    # 截断结尾保留字符数（用于续传提示）
+    "truncated_ending_chars": 500,
+
+    # 续传请求的 max_tokens（确保有足够空间完成）
+    "continuation_max_tokens": 8192,
+
+    # 日志级别
+    "log_continuations": True,
+}
+
 # 历史消息管理配置
 # 调整阈值，更早触发截断以避免 "Input is too long" 错误
 HISTORY_CONFIG = HistoryConfig(
@@ -1678,6 +1726,365 @@ def parse_inline_tool_calls(text: str) -> tuple[list, str]:
     return tool_uses, remaining_text
 
 
+# ==================== 智能接续机制 ====================
+
+class TruncationInfo:
+    """截断信息封装类"""
+    def __init__(self):
+        self.is_truncated = False
+        self.reason = None
+        self.truncated_text = ""
+        self.valid_tool_uses = []
+        self.failed_tool_uses = []
+        self.stream_completed = False
+        self.finish_reason = "end_turn"
+
+    def __repr__(self):
+        return f"TruncationInfo(truncated={self.is_truncated}, reason={self.reason}, valid_tools={len(self.valid_tool_uses)}, failed_tools={len(self.failed_tool_uses)})"
+
+
+def detect_truncation(full_text: str, stream_completed: bool, finish_reason: str, request_id: str) -> TruncationInfo:
+    """检测响应是否被截断，返回详细的截断信息
+
+    检测策略：
+    1. 流未正常完成（EOF/连接中断）
+    2. finish_reason 是 max_tokens 或 length
+    3. 工具调用 JSON 括号不匹配
+    4. 工具调用解析失败
+    """
+    info = TruncationInfo()
+    info.truncated_text = full_text
+    info.stream_completed = stream_completed
+    info.finish_reason = finish_reason
+
+    # 检测1: 流未正常完成
+    if not stream_completed:
+        info.is_truncated = True
+        info.reason = "stream_interrupted"
+        logger.warning(f"[{request_id}] 截断检测: 流未正常完成")
+
+    # 检测2: finish_reason 表示达到上限
+    if finish_reason in ("max_tokens", "length"):
+        info.is_truncated = True
+        info.reason = "max_tokens_reached"
+        logger.warning(f"[{request_id}] 截断检测: finish_reason={finish_reason}")
+
+    # 检测3: 工具调用 JSON 括号不匹配
+    if "[Calling tool:" in full_text:
+        open_braces = full_text.count('{')
+        close_braces = full_text.count('}')
+        if open_braces > close_braces:
+            info.is_truncated = True
+            info.reason = f"incomplete_json (braces: {open_braces} open, {close_braces} close)"
+            logger.warning(f"[{request_id}] 截断检测: JSON括号不匹配 - {info.reason}")
+
+    # 解析工具调用
+    tool_uses, remaining_text = parse_inline_tool_calls(full_text)
+
+    # 检测4: 检查解析结果中是否有错误
+    for tu in tool_uses:
+        inp = tu.get("input", {})
+        if isinstance(inp, dict) and ("_parse_error" in inp or "_raw" in inp):
+            info.failed_tool_uses.append(tu)
+            if not info.is_truncated:
+                info.is_truncated = True
+                info.reason = f"tool_parse_error in {tu.get('name', 'unknown')}"
+                logger.warning(f"[{request_id}] 截断检测: 工具解析失败 - {tu.get('name')}")
+        else:
+            info.valid_tool_uses.append(tu)
+
+    return info
+
+
+def build_continuation_request(
+    original_messages: list,
+    truncated_text: str,
+    original_body: dict,
+    continuation_count: int,
+    request_id: str
+) -> dict:
+    """构建续传请求
+
+    策略：
+    1. 保留原始消息历史
+    2. 添加截断的 assistant 响应
+    3. 添加续传提示作为新的 user 消息
+    """
+    config = CONTINUATION_CONFIG
+
+    # 获取截断结尾（用于续传提示）
+    ending_chars = config.get("truncated_ending_chars", 500)
+    truncated_ending = truncated_text[-ending_chars:] if len(truncated_text) > ending_chars else truncated_text
+
+    # 构建续传提示
+    continuation_prompt = config.get("continuation_prompt", "").format(
+        truncated_ending=truncated_ending
+    )
+
+    # 构建新的消息列表
+    new_messages = list(original_messages)  # 复制原始消息
+
+    # 添加截断的 assistant 响应
+    new_messages.append({
+        "role": "assistant",
+        "content": truncated_text
+    })
+
+    # 添加续传提示
+    new_messages.append({
+        "role": "user",
+        "content": continuation_prompt
+    })
+
+    # 构建新的请求体
+    new_body = dict(original_body)
+    new_body["messages"] = new_messages
+
+    # 使用续传专用的 max_tokens
+    new_body["max_tokens"] = config.get("continuation_max_tokens", 8192)
+
+    logger.info(f"[{request_id}] 构建续传请求 #{continuation_count + 1}: "
+                f"原始消息={len(original_messages)}, 新消息={len(new_messages)}, "
+                f"截断文本长度={len(truncated_text)}")
+
+    return new_body
+
+
+def merge_responses(original_text: str, continuation_text: str, request_id: str) -> str:
+    """合并原始响应和续传响应
+
+    策略：
+    1. 检测续传响应是否有重复内容
+    2. 智能拼接，避免重复
+    3. 处理 JSON 边界情况
+    """
+    if not continuation_text:
+        return original_text
+
+    # 清理续传响应开头可能的重复内容
+    continuation_clean = continuation_text.strip()
+
+    # 检查是否有明显的重复（续传响应以原始结尾开始）
+    overlap_check_len = min(100, len(original_text))
+    original_ending = original_text[-overlap_check_len:]
+
+    # 查找重叠
+    for i in range(len(original_ending), 0, -1):
+        if continuation_clean.startswith(original_ending[-i:]):
+            # 找到重叠，去除重复部分
+            continuation_clean = continuation_clean[i:]
+            logger.info(f"[{request_id}] 合并响应: 检测到 {i} 字符重叠，已去除")
+            break
+
+    # 智能拼接
+    # 检查原始文本是否在 JSON 中间被截断
+    if original_text.rstrip().endswith((',', ':', '"', '{', '[')):
+        # JSON 中间截断，直接拼接
+        merged = original_text + continuation_clean
+    elif original_text.rstrip()[-1:] in ('}', ']', '"') and continuation_clean.startswith((',', '}', ']')):
+        # JSON 结构边界，直接拼接
+        merged = original_text + continuation_clean
+    else:
+        # 其他情况，可能需要空格分隔
+        merged = original_text + continuation_clean
+
+    logger.info(f"[{request_id}] 合并响应: 原始={len(original_text)}, 续传={len(continuation_text)}, 合并后={len(merged)}")
+
+    return merged
+
+
+async def fetch_with_continuation(
+    openai_body: dict,
+    headers: dict,
+    request_id: str,
+    model: str,
+) -> tuple[str, str, bool, dict]:
+    """带接续机制的请求获取
+
+    Returns:
+        (full_text, finish_reason, stream_completed, usage_info)
+    """
+    config = CONTINUATION_CONFIG
+    max_continuations = config.get("max_continuations", 3)
+
+    accumulated_text = ""
+    continuation_count = 0
+    final_finish_reason = "end_turn"
+    final_stream_completed = False
+    total_input_tokens = 0
+    total_output_tokens = 0
+
+    current_body = dict(openai_body)
+    original_messages = list(openai_body.get("messages", []))
+
+    while continuation_count <= max_continuations:
+        # 发起请求
+        text, finish_reason, stream_completed, usage = await _fetch_single_stream(
+            current_body, headers, request_id, continuation_count
+        )
+
+        # 累积 token 计数
+        total_input_tokens += usage.get("input_tokens", 0)
+        total_output_tokens += usage.get("output_tokens", 0)
+
+        # 合并响应
+        if continuation_count == 0:
+            accumulated_text = text
+        else:
+            accumulated_text = merge_responses(accumulated_text, text, request_id)
+
+        # 检测是否需要续传
+        truncation_info = detect_truncation(accumulated_text, stream_completed, finish_reason, request_id)
+
+        if not truncation_info.is_truncated:
+            # 没有截断，正常完成
+            final_finish_reason = finish_reason
+            final_stream_completed = True
+            logger.info(f"[{request_id}] 请求完成: 无截断, 总续传次数={continuation_count}")
+            break
+
+        # 检查是否应该续传
+        should_continue = False
+        triggers = config.get("triggers", {})
+
+        if truncation_info.reason == "stream_interrupted" and triggers.get("stream_interrupted", True):
+            should_continue = True
+        elif truncation_info.reason == "max_tokens_reached" and triggers.get("max_tokens_reached", True):
+            should_continue = True
+        elif "incomplete_json" in str(truncation_info.reason) and triggers.get("incomplete_tool_json", True):
+            should_continue = True
+        elif "tool_parse_error" in str(truncation_info.reason) and triggers.get("parse_error", True):
+            should_continue = True
+
+        if not should_continue:
+            logger.info(f"[{request_id}] 截断但不续传: reason={truncation_info.reason}, triggers={triggers}")
+            final_finish_reason = finish_reason
+            final_stream_completed = stream_completed
+            break
+
+        if continuation_count >= max_continuations:
+            logger.warning(f"[{request_id}] 达到最大续传次数 {max_continuations}，停止续传")
+            final_finish_reason = "max_tokens"  # 标记为达到上限
+            final_stream_completed = False
+            break
+
+        # 构建续传请求
+        logger.info(f"[{request_id}] 触发续传 #{continuation_count + 1}: reason={truncation_info.reason}")
+        current_body = build_continuation_request(
+            original_messages,
+            accumulated_text,
+            openai_body,
+            continuation_count,
+            request_id
+        )
+        continuation_count += 1
+
+    return accumulated_text, final_finish_reason, final_stream_completed, {
+        "input_tokens": total_input_tokens,
+        "output_tokens": total_output_tokens,
+        "continuation_count": continuation_count
+    }
+
+
+async def _fetch_single_stream(
+    openai_body: dict,
+    headers: dict,
+    request_id: str,
+    continuation_count: int
+) -> tuple[str, str, bool, dict]:
+    """执行单次流式请求
+
+    Returns:
+        (text, finish_reason, stream_completed, usage)
+    """
+    full_text = ""
+    finish_reason = "end_turn"
+    stream_completed = False
+    input_tokens = 0
+    output_tokens = 0
+
+    try:
+        client = get_http_client()
+        async with client.stream(
+            "POST",
+            KIRO_PROXY_URL,
+            json=openai_body,
+            headers=headers,
+        ) as response:
+            if response.status_code != 200:
+                error_text = await response.aread()
+                error_str = error_text.decode()
+                logger.error(f"[{request_id}] 续传请求 #{continuation_count} 失败: {response.status_code} - {error_str[:200]}")
+                return "", "error", False, {"input_tokens": 0, "output_tokens": 0}
+
+            buffer = ""
+            try:
+                async for chunk in response.aiter_text():
+                    buffer += chunk
+                    while "\n" in buffer:
+                        line, buffer = buffer.split("\n", 1)
+                        line = line.strip()
+                        if not line or not line.startswith("data:"):
+                            continue
+
+                        data_str = line[5:].strip()
+                        if data_str == "[DONE]":
+                            stream_completed = True
+                            continue
+
+                        try:
+                            data = json.loads(data_str)
+
+                            # 获取 usage
+                            usage = data.get("usage")
+                            if usage:
+                                input_tokens = usage.get("prompt_tokens", input_tokens)
+                                output_tokens = usage.get("completion_tokens", output_tokens)
+
+                            choice = data.get("choices", [{}])[0]
+                            delta = choice.get("delta", {})
+                            fr = choice.get("finish_reason")
+
+                            if fr:
+                                stream_completed = True
+                                if fr == "tool_calls":
+                                    finish_reason = "tool_use"
+                                elif fr == "length":
+                                    finish_reason = "max_tokens"
+                                elif fr == "stop":
+                                    finish_reason = "end_turn"
+
+                            content = delta.get("content", "")
+                            if content:
+                                full_text += content
+
+                        except json.JSONDecodeError:
+                            pass
+
+            except (httpx.RemoteProtocolError, httpx.ReadError) as e:
+                logger.error(f"[{request_id}] 续传请求 #{continuation_count} 流中断: {type(e).__name__}")
+                stream_completed = False
+
+    except httpx.TimeoutException:
+        logger.error(f"[{request_id}] 续传请求 #{continuation_count} 超时")
+        return full_text, "timeout", False, {"input_tokens": input_tokens, "output_tokens": output_tokens}
+    except Exception as e:
+        logger.error(f"[{request_id}] 续传请求 #{continuation_count} 异常: {type(e).__name__}: {e}")
+        return full_text, "error", False, {"input_tokens": input_tokens, "output_tokens": output_tokens}
+
+    # 估算 token（如果 API 没返回）
+    if output_tokens == 0:
+        output_tokens = estimate_tokens(full_text)
+
+    logger.info(f"[{request_id}] 续传请求 #{continuation_count} 完成: "
+                f"text_len={len(full_text)}, finish={finish_reason}, completed={stream_completed}")
+
+    return full_text, finish_reason, stream_completed, {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens
+    }
+
+
 def convert_openai_to_anthropic(openai_response: dict, model: str, request_id: str) -> dict:
     """将 OpenAI 响应转换为 Anthropic 格式
 
@@ -1953,11 +2360,13 @@ async def handle_anthropic_stream_via_openai(
 ) -> StreamingResponse:
     """处理 Anthropic 流式请求 - 通过 OpenAI 格式
 
-    关键增强：检测内联工具调用并转换为标准 tool_use content blocks
-    策略：累积完整响应后解析，然后正确发送 content blocks
+    关键增强：
+    1. 检测内联工具调用并转换为标准 tool_use content blocks
+    2. 智能接续机制 - 当检测到截断时自动发起续传请求
+    3. 高并发优化 - 使用全局 HTTP 客户端连接池
+    4. Token 计数 - 支持从 OpenAI API 获取或估算 token 数量
 
-    高并发优化：使用全局 HTTP 客户端连接池
-    Token 计数：支持从 OpenAI API 获取或估算 token 数量
+    策略：累积完整响应后解析，检测截断并自动续传，然后正确发送 content blocks
     """
 
     # 预估输入 token 数
@@ -1976,261 +2385,134 @@ async def handle_anthropic_stream_via_openai(
 
     async def generate() -> AsyncIterator[bytes]:
         try:
-            client = get_http_client()
-            async with client.stream(
-                "POST",
-                KIRO_PROXY_URL,
-                json=openai_body,
-                headers=headers,
-            ) as response:
-                if response.status_code != 200:
-                    error_text = await response.aread()
-                    error_str = error_text.decode()
-                    logger.error(f"[{request_id}] OpenAI API Error {response.status_code}: {error_str[:200]}")
+            # 发送 Anthropic 流式头
+            msg_start = {
+                "type": "message_start",
+                "message": {
+                    "id": f"msg_{request_id}",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                    "model": model,
+                    "stop_reason": None,
+                    "stop_sequence": None,
+                    "usage": {"input_tokens": estimated_input_tokens, "output_tokens": 0}
+                }
+            }
+            yield f"data: {json.dumps(msg_start)}\n\n".encode()
 
-                    error_response = {
-                        "type": "error",
-                        "error": {
-                            "type": "api_error",
-                            "message": error_str[:500],
+            # ========== 智能接续机制 ==========
+            # 使用 fetch_with_continuation 获取完整响应（自动处理截断和续传）
+            if CONTINUATION_CONFIG.get("enabled", True):
+                full_text, finish_reason, stream_completed, usage_info = await fetch_with_continuation(
+                    openai_body, headers, request_id, model
+                )
+                input_tokens = usage_info.get("input_tokens", estimated_input_tokens)
+                output_tokens = usage_info.get("output_tokens", 0)
+                continuation_count = usage_info.get("continuation_count", 0)
+
+                if continuation_count > 0:
+                    logger.info(f"[{request_id}] 🔄 接续完成: {continuation_count} 次续传, "
+                                f"最终文本长度={len(full_text)}")
+            else:
+                # 接续机制禁用，使用单次请求
+                full_text, finish_reason, stream_completed, usage_info = await _fetch_single_stream(
+                    openai_body, headers, request_id, 0
+                )
+                input_tokens = usage_info.get("input_tokens", estimated_input_tokens)
+                output_tokens = usage_info.get("output_tokens", 0)
+
+            # 检测最终响应是否仍有截断（接续后仍可能有问题）
+            truncation_info = detect_truncation(full_text, stream_completed, finish_reason, request_id)
+
+            # 解析内联工具调用
+            tool_uses, remaining_text = parse_inline_tool_calls(full_text)
+
+            # 处理截断情况
+            if truncation_info.is_truncated:
+                # 过滤掉解析失败的工具调用
+                valid_tools = []
+                for tu in tool_uses:
+                    inp = tu.get("input", {})
+                    if isinstance(inp, dict) and ("_parse_error" not in inp and "_raw" not in inp):
+                        valid_tools.append(tu)
+                    else:
+                        logger.warning(f"[{request_id}] 丢弃无效工具调用: {tu.get('name')} - "
+                                       f"{inp.get('_parse_error', 'unknown error')[:100]}")
+
+                if valid_tools:
+                    tool_uses = valid_tools
+                    logger.info(f"[{request_id}] 恢复 {len(valid_tools)} 个有效工具调用")
+                else:
+                    # 所有工具调用都失败，作为纯文本返回
+                    tool_uses = []
+                    remaining_text = full_text
+                    logger.warning(f"[{request_id}] 所有工具调用解析失败，回退为纯文本响应")
+                    # 添加截断警告到响应
+                    remaining_text += f"\n\n[⚠️ Response truncated: {truncation_info.reason}]"
+
+            # 发送 content blocks
+            block_index = 0
+
+            # 1. 发送文本 content block（如果有）
+            if remaining_text:
+                yield f'data: {{"type":"content_block_start","index":{block_index},"content_block":{{"type":"text","text":""}}}}\n\n'.encode()
+                yield f'data: {{"type":"content_block_delta","index":{block_index},"delta":{{"type":"text_delta","text":{json.dumps(remaining_text)}}}}}\n\n'.encode()
+                yield f'data: {{"type":"content_block_stop","index":{block_index}}}\n\n'.encode()
+                block_index += 1
+            elif not tool_uses:
+                # 没有文本也没有工具，发送空文本
+                yield f'data: {{"type":"content_block_start","index":0,"content_block":{{"type":"text","text":""}}}}\n\n'.encode()
+                yield f'data: {{"type":"content_block_stop","index":0}}\n\n'.encode()
+                block_index = 1
+
+            # 2. 发送 tool_use content blocks
+            if tool_uses:
+                finish_reason = "tool_use"
+                for tool_use in tool_uses:
+                    # content_block_start
+                    tool_start = {
+                        "type": "content_block_start",
+                        "index": block_index,
+                        "content_block": {
+                            "type": "tool_use",
+                            "id": tool_use["id"],
+                            "name": tool_use["name"],
+                            "input": {}
                         }
                     }
-                    yield f"data: {json.dumps(error_response)}\n\n".encode()
-                    return
+                    yield f"data: {json.dumps(tool_start)}\n\n".encode()
 
-                # 发送 Anthropic 流式头
-                msg_start = {
-                    "type": "message_start",
-                    "message": {
-                        "id": f"msg_{request_id}",
-                        "type": "message",
-                        "role": "assistant",
-                        "content": [],
-                        "model": model,
-                        "stop_reason": None,
-                        "stop_sequence": None,
-                        "usage": {"input_tokens": estimated_input_tokens, "output_tokens": 0}
+                    # input_json_delta - 构建完整的 delta 对象避免双重编码
+                    delta_event = {
+                        "type": "content_block_delta",
+                        "index": block_index,
+                        "delta": {
+                            "type": "input_json_delta",
+                            "partial_json": json.dumps(tool_use["input"])
+                        }
                     }
-                }
-                yield f"data: {json.dumps(msg_start)}\n\n".encode()
+                    yield f"data: {json.dumps(delta_event)}\n\n".encode()
 
-                # 累积完整响应文本，然后解析
-                full_text = ""
-                buffer = ""
-                finish_reason = "end_turn"
-                has_openai_tool_calls = False
-                openai_tool_calls = {}
-
-                # Token 计数：从 OpenAI 响应获取
-                input_tokens = estimated_input_tokens  # 默认使用估算值
-                output_tokens = 0
-                stream_completed = False  # 标记流是否正常完成
-                received_done = False     # 是否收到 [DONE] 信号
-
-                try:
-                    async for chunk in response.aiter_text():
-                        buffer += chunk
-                        while "\n" in buffer:
-                            line, buffer = buffer.split("\n", 1)
-                            line = line.strip()
-                            if not line or not line.startswith("data:"):
-                                continue
-
-                            data_str = line[5:].strip()
-                            if data_str == "[DONE]":
-                                received_done = True
-                                stream_completed = True
-                                continue
-
-                            try:
-                                data = json.loads(data_str)
-
-                                # 捕获 OpenAI usage 信息（stream_options: include_usage）
-                                usage = data.get("usage")
-                                if usage:
-                                    input_tokens = usage.get("prompt_tokens", input_tokens)
-                                    output_tokens = usage.get("completion_tokens", output_tokens)
-
-                                choice = data.get("choices", [{}])[0]
-                                delta = choice.get("delta", {})
-                                fr = choice.get("finish_reason")
-                                if fr:
-                                    stream_completed = True  # 有 finish_reason 表示正常结束
-                                    if fr == "tool_calls":
-                                        finish_reason = "tool_use"
-                                    elif fr == "length":
-                                        finish_reason = "max_tokens"
-                                    elif fr == "stop":
-                                        finish_reason = "end_turn"
-
-                                # 累积文本
-                                content = delta.get("content", "")
-                                if content:
-                                    full_text += content
-
-                                # 处理 OpenAI 原生 tool_calls（如果有）
-                                tool_calls = delta.get("tool_calls", [])
-                                for tc in tool_calls:
-                                    tc_index = tc.get("index", 0)
-                                    tc_id = tc.get("id")
-                                    tc_func = tc.get("function", {})
-
-                                    if tc_id:
-                                        has_openai_tool_calls = True
-                                        openai_tool_calls[tc_index] = {
-                                            "id": tc_id,
-                                            "name": tc_func.get("name", ""),
-                                            "arguments": ""
-                                        }
-
-                                    if tc_index in openai_tool_calls and tc_func.get("arguments"):
-                                        openai_tool_calls[tc_index]["arguments"] += tc_func["arguments"]
-
-                            except json.JSONDecodeError:
-                                pass
-
-                except (httpx.RemoteProtocolError, httpx.ReadError) as stream_error:
-                    # EOF / 连接中断错误
-                    logger.error(f"[{request_id}] ⚠️ 流被中断 (EOF): {type(stream_error).__name__}: {stream_error}")
-                    stream_completed = False
-
-                # 检测响应是否被截断（常见截断标志）
-                is_truncated = False
-                truncation_reason = None
-
-                # 检测0: 流未正常完成（EOF/连接中断）
-                if not stream_completed:
-                    is_truncated = True
-                    truncation_reason = "stream_interrupted (EOF)"
-                    logger.warning(f"[{request_id}] 流未正常完成: received_done={received_done}, text_len={len(full_text)}")
-
-                # 检测1: finish_reason 是 max_tokens 或 length
-                if finish_reason in ("max_tokens", "length"):
-                    is_truncated = True
-                    truncation_reason = "max_tokens_reached"
-                    logger.warning(f"[{request_id}] 响应被截断: finish_reason={finish_reason}")
-
-                # 检测2: 检查工具调用 JSON 是否完整（括号匹配）
-                if not is_truncated and "[Calling tool:" in full_text:
-                    open_braces = full_text.count('{')
-                    close_braces = full_text.count('}')
-                    if open_braces > close_braces:
-                        is_truncated = True
-                        truncation_reason = f"incomplete_json (braces: {open_braces} open, {close_braces} close)"
-                        logger.warning(f"[{request_id}] 检测到不完整 JSON: {truncation_reason}")
-
-                # 解析内联工具调用
-                tool_uses, remaining_text = parse_inline_tool_calls(full_text)
-
-                # 检测3: 解析后检查是否有 _parse_error 或 _raw
-                has_parse_errors = False
-                for tu in tool_uses:
-                    if isinstance(tu.get("input"), dict):
-                        if "_parse_error" in tu["input"] or "_raw" in tu["input"]:
-                            has_parse_errors = True
-                            is_truncated = True
-                            truncation_reason = f"tool_parse_error in {tu.get('name', 'unknown')}"
-                            logger.warning(f"[{request_id}] 工具调用解析失败: {tu.get('name')}")
-                            break
-
-                # 如果检测到截断且有工具调用，尝试恢复
-                if is_truncated and tool_uses:
-                    # 过滤掉解析失败的工具调用
-                    valid_tools = []
-                    for tu in tool_uses:
-                        inp = tu.get("input", {})
-                        if isinstance(inp, dict) and ("_parse_error" not in inp and "_raw" not in inp):
-                            valid_tools.append(tu)
-                        else:
-                            # 记录失败的工具调用
-                            logger.warning(f"[{request_id}] 丢弃无效工具调用: {tu.get('name')} - {inp.get('_parse_error', 'unknown error')[:100]}")
-
-                    if valid_tools:
-                        tool_uses = valid_tools
-                        logger.info(f"[{request_id}] 恢复 {len(valid_tools)} 个有效工具调用")
-                    else:
-                        # 所有工具调用都失败，作为纯文本返回
-                        tool_uses = []
-                        remaining_text = full_text
-                        logger.warning(f"[{request_id}] 所有工具调用解析失败，回退为纯文本响应")
-                        # 添加截断警告到响应
-                        remaining_text += f"\n\n[⚠️ Response truncated: {truncation_reason}]"
-
-                # 添加 OpenAI 原生工具调用
-                for tc_data in openai_tool_calls.values():
-                    try:
-                        args = json.loads(tc_data["arguments"])
-                    except:
-                        args = {"raw": tc_data["arguments"]}
-                    tool_uses.append({
-                        "type": "tool_use",
-                        "id": tc_data["id"],
-                        "name": tc_data["name"],
-                        "input": args
-                    })
-
-                # 发送 content blocks
-                block_index = 0
-
-                # 1. 发送文本 content block（如果有）
-                if remaining_text:
-                    yield f'data: {{"type":"content_block_start","index":{block_index},"content_block":{{"type":"text","text":""}}}}\n\n'.encode()
-                    yield f'data: {{"type":"content_block_delta","index":{block_index},"delta":{{"type":"text_delta","text":{json.dumps(remaining_text)}}}}}\n\n'.encode()
+                    # content_block_stop
                     yield f'data: {{"type":"content_block_stop","index":{block_index}}}\n\n'.encode()
                     block_index += 1
-                elif not tool_uses:
-                    # 没有文本也没有工具，发送空文本
-                    yield f'data: {{"type":"content_block_start","index":0,"content_block":{{"type":"text","text":""}}}}\n\n'.encode()
-                    yield f'data: {{"type":"content_block_stop","index":0}}\n\n'.encode()
-                    block_index = 1
 
-                # 2. 发送 tool_use content blocks
-                if tool_uses:
-                    finish_reason = "tool_use"
-                    for tool_use in tool_uses:
-                        # content_block_start
-                        tool_start = {
-                            "type": "content_block_start",
-                            "index": block_index,
-                            "content_block": {
-                                "type": "tool_use",
-                                "id": tool_use["id"],
-                                "name": tool_use["name"],
-                                "input": {}
-                            }
-                        }
-                        yield f"data: {json.dumps(tool_start)}\n\n".encode()
+            # 如果 OpenAI 没有返回 usage，使用估算值
+            if output_tokens == 0:
+                output_tokens = estimate_tokens(full_text)
 
-                        # input_json_delta - 构建完整的 delta 对象避免双重编码
-                        delta_event = {
-                            "type": "content_block_delta",
-                            "index": block_index,
-                            "delta": {
-                                "type": "input_json_delta",
-                                "partial_json": json.dumps(tool_use["input"])
-                            }
-                        }
-                        yield f"data: {json.dumps(delta_event)}\n\n".encode()
+            # 如果检测到截断，记录详细信息
+            if truncation_info.is_truncated:
+                logger.warning(f"[{request_id}] ⚠️ 响应截断完成: reason={truncation_info.reason}, "
+                               f"text_len={len(full_text)}, tools={len(tool_uses)}, "
+                               f"finish_reason={finish_reason}")
 
-                        # content_block_stop
-                        yield f'data: {{"type":"content_block_stop","index":{block_index}}}\n\n'.encode()
-                        block_index += 1
+            # message delta with token usage
+            yield f'data: {{"type":"message_delta","delta":{{"stop_reason":"{finish_reason}","stop_sequence":null}},"usage":{{"output_tokens":{output_tokens}}}}}\n\n'.encode()
 
-                # 如果 OpenAI 没有返回 usage，使用估算值
-                if output_tokens == 0:
-                    output_tokens = estimate_tokens(full_text)
-
-                # 如果检测到截断，记录详细信息
-                if is_truncated:
-                    logger.warning(f"[{request_id}] ⚠️ 响应截断完成: reason={truncation_reason}, "
-                                   f"text_len={len(full_text)}, tools={len(tool_uses)}, "
-                                   f"finish_reason={finish_reason}")
-
-                # message delta with token usage
-                yield f'data: {{"type":"message_delta","delta":{{"stop_reason":"{finish_reason}","stop_sequence":null}},"usage":{{"output_tokens":{output_tokens}}}}}\n\n'.encode()
-
-                # message stop
-                yield f'data: {{"type":"message_stop"}}\n\n'.encode()
+            # message stop
+            yield f'data: {{"type":"message_stop"}}\n\n'.encode()
 
         except httpx.TimeoutException:
             logger.error(f"[{request_id}] 请求超时")
