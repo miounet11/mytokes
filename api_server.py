@@ -44,42 +44,39 @@ CONTINUATION_CONFIG = {
     # 启用接续机制
     "enabled": True,
 
-    # 最大续传次数（防止无限循环）
-    "max_continuations": 3,
+    # 最大续传次数（防止无限循环）- 增加到 5 次以处理复杂响应
+    "max_continuations": 5,
 
-    # 触发续传的条件
+    # 触发续传的条件（按优先级）
     "triggers": {
-        # 流中断（EOF/连接断开）
-        "stream_interrupted": True,
-        # max_tokens 达到上限
-        "max_tokens_reached": True,
-        # 工具调用 JSON 不完整
-        "incomplete_tool_json": True,
-        # 解析错误
-        "parse_error": True,
-        # 代码块未闭合（新增）
-        "incomplete_code_block": True,
-        # 语句未完成（新增）
-        "incomplete_statement": True,
+        # 高优先级 - 明确的截断信号
+        "stream_interrupted": True,      # 流中断（EOF/连接断开）
+        "max_tokens_reached": True,      # max_tokens 达到上限
+        "incomplete_tool_json": True,    # 工具调用 JSON 不完整
+
+        # 中优先级 - 结构性问题
+        "parse_error": True,             # 解析错误
+        "incomplete_code_block": True,   # 代码块未闭合
+
+        # 低优先级 - 启发式检测（更保守，避免误报）
+        "incomplete_statement": False,   # 禁用语句检测（误报太多）
     },
 
     # 续传提示词模板
-    "continuation_prompt": """Your previous response was truncated mid-sentence. Please continue EXACTLY from where you stopped.
+    "continuation_prompt": """Your previous response was truncated. Continue EXACTLY from where you stopped.
 
-CRITICAL RULES:
-1. Do NOT repeat ANY content you already generated
-2. Do NOT add preambles like "Continuing from where I left off..."
-3. Continue the EXACT statement/code/JSON that was cut off
-4. If in a code block, continue inside the same code block (don't start a new one)
-5. If in a tool call, complete the JSON properly
-6. Match the exact context and tone of where you were interrupted
+RULES:
+- Do NOT repeat any content
+- Do NOT add preambles
+- Continue the exact code/JSON/text that was cut off
+- If in a code block, stay in the same block
 
-Your truncated response ended with:
+Truncated ending:
 ```
 {truncated_ending}
 ```
 
-Continue DIRECTLY from here (complete the partial statement/code/JSON):""",
+Continue:""",
 
     # 截断结尾保留字符数（用于续传提示）
     "truncated_ending_chars": 500,
@@ -1841,25 +1838,22 @@ def detect_truncation(full_text: str, stream_completed: bool, finish_reason: str
             info.valid_tool_uses.append(tu)
 
     # 检测6: 启发式检测 - 文本末尾是否在语句中间被截断
-    # 如果已经检测到截断，跳过这个检查
-    if not info.is_truncated and len(full_text) > 100:
+    # 注意：这个检测优先级最低，只在其他检测都没触发时才检查
+    # 并且只在 stream_completed=True 且 finish_reason 正常时才检查
+    # 避免误报导致不必要的续传
+    if not info.is_truncated and len(full_text) > 100 and stream_completed and finish_reason in ("end_turn", "stop"):
         last_100_chars = full_text[-100:].strip()
-        # 检查是否以不完整的语句结尾
+
+        # 只检查明确的截断模式（更保守）
+        # 这些模式只在代码块内且明显未完成时才触发
         incomplete_patterns = [
-            # SQL 语句未完成
-            r'\bINSERT\s+INTO\s+\w+\s*$',
-            r'\bSELECT\s+.*\s+FROM\s+\w+\s*$',
-            r'\bUPDATE\s+\w+\s+SET\s*$',
-            r'\bWHERE\s+\w+\s*=\s*$',
-            # 代码语句未完成
-            r'function\s+\w+\s*\(\s*$',
-            r'const\s+\w+\s*=\s*$',
-            r'if\s*\(\s*$',
-            r'for\s*\(\s*$',
-            # 括号/引号未闭合
-            r'\([^)]*$',  # 左括号未闭合
-            r'["\'][^"\']*$',  # 引号未闭合
-            r'\{[^}]*$',  # 花括号未闭合（排除工具调用）
+            # SQL 语句明显未完成（关键字后没有内容）
+            r'\bINSERT\s+INTO\s+\w+\s*\($',  # INSERT INTO table(
+            r'\bVALUES\s*\(\s*$',  # VALUES (
+            r'\bSET\s+\w+\s*=\s*$',  # SET column =
+            # 代码定义明显未完成
+            r'function\s+\w+\s*\([^)]*$',  # function name( 参数未闭合
+            r'=>\s*\{?\s*$',  # 箭头函数后没有内容
         ]
 
         import re
