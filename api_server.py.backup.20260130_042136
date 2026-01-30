@@ -57,29 +57,23 @@ CONTINUATION_CONFIG = {
         "incomplete_tool_json": True,
         # 解析错误
         "parse_error": True,
-        # 代码块未闭合（新增）
-        "incomplete_code_block": True,
-        # 语句未完成（新增）
-        "incomplete_statement": True,
     },
 
     # 续传提示词模板
-    "continuation_prompt": """Your previous response was truncated mid-sentence. Please continue EXACTLY from where you stopped.
+    "continuation_prompt": """Your previous response was truncated. Please continue EXACTLY from where you stopped.
 
-CRITICAL RULES:
-1. Do NOT repeat ANY content you already generated
-2. Do NOT add preambles like "Continuing from where I left off..."
-3. Continue the EXACT statement/code/JSON that was cut off
-4. If in a code block, continue inside the same code block (don't start a new one)
-5. If in a tool call, complete the JSON properly
-6. Match the exact context and tone of where you were interrupted
+IMPORTANT:
+- Do NOT repeat any content you already generated
+- Do NOT add any preamble or explanation
+- Continue the JSON/tool call from the exact character where it was cut off
+- If you were in the middle of a tool call, complete it properly
 
 Your truncated response ended with:
 ```
 {truncated_ending}
 ```
 
-Continue DIRECTLY from here (complete the partial statement/code/JSON):""",
+Continue from here:""",
 
     # 截断结尾保留字符数（用于续传提示）
     "truncated_ending_chars": 500,
@@ -1786,9 +1780,8 @@ def detect_truncation(full_text: str, stream_completed: bool, finish_reason: str
     检测策略：
     1. 流未正常完成（EOF/连接中断）
     2. finish_reason 是 max_tokens 或 length
-    3. 代码块未闭合（``` 括号不匹配）
-    4. 工具调用 JSON 括号不匹配
-    5. 工具调用解析失败
+    3. 工具调用 JSON 括号不匹配
+    4. 工具调用解析失败
     """
     info = TruncationInfo()
     info.truncated_text = full_text
@@ -1807,16 +1800,7 @@ def detect_truncation(full_text: str, stream_completed: bool, finish_reason: str
         info.reason = "max_tokens_reached"
         logger.warning(f"[{request_id}] 截断检测: finish_reason={finish_reason}")
 
-    # 检测3: 代码块未闭合检测（重要！针对普通代码输出）
-    code_fence_count = full_text.count("```")
-    if code_fence_count % 2 != 0:
-        # 奇数个 ``` 表示有未闭合的代码块
-        if not info.is_truncated:
-            info.is_truncated = True
-            info.reason = f"incomplete_code_block (fence_count: {code_fence_count})"
-            logger.warning(f"[{request_id}] 截断检测: 代码块未闭合 - {code_fence_count} 个 ``` 标记")
-
-    # 检测4: 工具调用 JSON 括号不匹配
+    # 检测3: 工具调用 JSON 括号不匹配
     if "[Calling tool:" in full_text:
         open_braces = full_text.count('{')
         close_braces = full_text.count('}')
@@ -1828,7 +1812,7 @@ def detect_truncation(full_text: str, stream_completed: bool, finish_reason: str
     # 解析工具调用
     tool_uses, remaining_text = parse_inline_tool_calls(full_text)
 
-    # 检测5: 检查解析结果中是否有错误
+    # 检测4: 检查解析结果中是否有错误
     for tu in tool_uses:
         inp = tu.get("input", {})
         if isinstance(inp, dict) and ("_parse_error" in inp or "_raw" in inp):
@@ -1839,36 +1823,6 @@ def detect_truncation(full_text: str, stream_completed: bool, finish_reason: str
                 logger.warning(f"[{request_id}] 截断检测: 工具解析失败 - {tu.get('name')}")
         else:
             info.valid_tool_uses.append(tu)
-
-    # 检测6: 启发式检测 - 文本末尾是否在语句中间被截断
-    # 如果已经检测到截断，跳过这个检查
-    if not info.is_truncated and len(full_text) > 100:
-        last_100_chars = full_text[-100:].strip()
-        # 检查是否以不完整的语句结尾
-        incomplete_patterns = [
-            # SQL 语句未完成
-            r'\bINSERT\s+INTO\s+\w+\s*$',
-            r'\bSELECT\s+.*\s+FROM\s+\w+\s*$',
-            r'\bUPDATE\s+\w+\s+SET\s*$',
-            r'\bWHERE\s+\w+\s*=\s*$',
-            # 代码语句未完成
-            r'function\s+\w+\s*\(\s*$',
-            r'const\s+\w+\s*=\s*$',
-            r'if\s*\(\s*$',
-            r'for\s*\(\s*$',
-            # 括号/引号未闭合
-            r'\([^)]*$',  # 左括号未闭合
-            r'["\'][^"\']*$',  # 引号未闭合
-            r'\{[^}]*$',  # 花括号未闭合（排除工具调用）
-        ]
-
-        import re
-        for pattern in incomplete_patterns:
-            if re.search(pattern, last_100_chars, re.IGNORECASE):
-                info.is_truncated = True
-                info.reason = f"incomplete_statement (pattern: {pattern[:30]}...)"
-                logger.warning(f"[{request_id}] 截断检测: 语句未完成 - {info.reason}")
-                break
 
     return info
 
@@ -2023,19 +1977,14 @@ async def fetch_with_continuation(
         # 检查是否应该续传
         should_continue = False
         triggers = config.get("triggers", {})
-        reason = truncation_info.reason
 
-        if reason == "stream_interrupted" and triggers.get("stream_interrupted", True):
+        if truncation_info.reason == "stream_interrupted" and triggers.get("stream_interrupted", True):
             should_continue = True
-        elif reason == "max_tokens_reached" and triggers.get("max_tokens_reached", True):
+        elif truncation_info.reason == "max_tokens_reached" and triggers.get("max_tokens_reached", True):
             should_continue = True
-        elif "incomplete_json" in str(reason) and triggers.get("incomplete_tool_json", True):
+        elif "incomplete_json" in str(truncation_info.reason) and triggers.get("incomplete_tool_json", True):
             should_continue = True
-        elif "tool_parse_error" in str(reason) and triggers.get("parse_error", True):
-            should_continue = True
-        elif "incomplete_code_block" in str(reason) and triggers.get("incomplete_code_block", True):
-            should_continue = True
-        elif "incomplete_statement" in str(reason) and triggers.get("incomplete_statement", True):
+        elif "tool_parse_error" in str(truncation_info.reason) and triggers.get("parse_error", True):
             should_continue = True
 
         if not should_continue:

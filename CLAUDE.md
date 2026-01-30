@@ -67,30 +67,36 @@ curl http://127.0.0.1:8100/admin/routing/stats
 
 ## Smart Model Routing Configuration
 
-Located in `api_server.py` around line 68-164.
+Located in `api_server.py` around line 120-215.
 
 ### How It Works
 
 The router intercepts Opus requests and decides whether to use Opus or Sonnet based on:
 
-1. **Priority 0 (Force Opus):**
+**Priority 0 (Whitelist - Highest Priority):**
+   - Request header `X-Force-Model: opus` → Always Opus
+   - Message contains `[FORCE_OPUS]` marker → Always Opus
+
+**Priority 1 (Force Opus):**
    - Extended Thinking requests → Always Opus
-   - Main Agent first turn → 60% Opus probability
+   - Main Agent first turn → 35% Opus probability
 
-2. **Priority 1 (Force Opus Keywords):**
-   - Creation tasks: "创建项目", "设计架构", "规划"
-   - Analysis tasks: "分析", "诊断", "检查问题"
+**Priority 2 (Force Opus Keywords):**
+   - Core tasks only: "创建项目", "系统设计", "架构设计", "整体重构", "整体规划"
+   - Streamlined to 18 keywords (down from 30+)
 
-3. **Priority 2 (Force Sonnet Keywords):**
-   - Simple tasks: "看看", "显示", "修复"
-   - Execution: "运行", "安装", "搜索"
+**Priority 3 (Force Sonnet Keywords):**
+   - Common operations: "看看", "显示", "修复", "运行", "调试", "优化", "配置"
+   - Expanded to 60+ keywords for better coverage
 
-4. **Priority 3 (Conversation Phase):**
-   - First turn (≤2 messages): 90% Opus
-   - Execution phase (≥5 tool calls): 80% Sonnet
+**Priority 4 (Conversation Phase):**
+   - First turn (≤2 messages): 50% Opus
+   - Execution phase (≥5 tool calls): 85% Sonnet
 
-5. **Priority 4 (Base Probability):**
-   - Default: 30% Opus, 70% Sonnet
+**Priority 5 (Base Probability):**
+   - Default: 15% Opus, 85% Sonnet
+
+**Target Opus Usage: 20-25%** (optimized for high concurrency)
 
 ### Key Configuration Parameters
 
@@ -100,29 +106,54 @@ MODEL_ROUTING_CONFIG = {
     "opus_model": "claude-opus-4-5-20251101",    # Target Opus model
     "sonnet_model": "claude-sonnet-4-5-20250929", # Target Sonnet model
 
+    # Whitelist mechanism
+    "whitelist_enabled": True,                    # Enable whitelist
+    "whitelist_header": "X-Force-Model",          # Header name
+    "whitelist_marker": "[FORCE_OPUS]",           # Message marker
+
     # Force Opus scenarios
     "force_opus_on_thinking": True,               # Extended Thinking → Opus
-    "main_agent_opus_probability": 60,            # Main agent 60% Opus
+    "main_agent_opus_probability": 35,            # Main agent 35% Opus
 
     # Conversation detection
-    "first_turn_opus_probability": 90,            # First turn 90% Opus
+    "first_turn_opus_probability": 50,            # First turn 50% Opus
     "first_turn_max_user_messages": 2,            # ≤2 messages = first turn
 
     # Execution phase
     "execution_phase_tool_calls": 5,              # ≥5 tools = execution
-    "execution_phase_sonnet_probability": 80,    # Execution 80% Sonnet
+    "execution_phase_sonnet_probability": 85,     # Execution 85% Sonnet
 
     # Base probability
-    "base_opus_probability": 30,                  # Default 30% Opus
+    "base_opus_probability": 15,                  # Default 15% Opus
+}
+```
+
+### Using the Whitelist
+
+**Via Request Header:**
+```bash
+curl -X POST http://127.0.0.1:8100/v1/messages \
+  -H "X-Force-Model: opus" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "claude-opus-4-5-20251101", "messages": [...]}'
+```
+
+**Via Message Marker:**
+```json
+{
+  "model": "claude-opus-4-5-20251101",
+  "messages": [
+    {"role": "user", "content": "[FORCE_OPUS] This task requires Opus"}
+  ]
 }
 ```
 
 ### Tuning Guidelines
 
 **To increase Opus usage:**
-- Increase `first_turn_opus_probability` (e.g., 90 → 95)
-- Increase `main_agent_opus_probability` (e.g., 60 → 80)
-- Increase `base_opus_probability` (e.g., 30 → 40)
+- Increase `first_turn_opus_probability` (e.g., 50 → 60)
+- Increase `main_agent_opus_probability` (e.g., 35 → 45)
+- Increase `base_opus_probability` (e.g., 15 → 20)
 - Add more keywords to `force_opus_keywords`
 
 **To decrease Opus usage (cost savings):**
