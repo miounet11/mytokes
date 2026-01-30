@@ -44,8 +44,8 @@ CONTINUATION_CONFIG = {
     # 启用接续机制
     "enabled": True,
 
-    # 最大续传次数（防止无限循环）- 增加到 5 次以处理复杂响应
-    "max_continuations": 5,
+    # 最大续传次数（防止无限循环）- 增加到 8 次以处理超长响应
+    "max_continuations": 8,
 
     # 触发续传的条件（按优先级）
     "triggers": {
@@ -62,30 +62,35 @@ CONTINUATION_CONFIG = {
         "incomplete_statement": False,   # 禁用语句检测（误报太多）
     },
 
-    # 续传提示词模板
-    "continuation_prompt": """Your previous response was truncated. Continue EXACTLY from where you stopped.
+    # 续传提示词模板 - 优化版，更精准的指令
+    "continuation_prompt": """CONTINUE OUTPUT - Your response was cut off mid-stream.
 
-RULES:
-- Do NOT repeat any content
-- Do NOT add preambles
-- Continue the exact code/JSON/text that was cut off
-- If in a code block, stay in the same block
+CRITICAL RULES:
+1. Resume EXACTLY where you stopped - no repetition
+2. If mid-JSON: complete the JSON structure
+3. If mid-code: complete the code block
+4. NO preambles, NO explanations, just continue
 
-Truncated ending:
-```
+Last output fragment:
 {truncated_ending}
-```
 
-Continue:""",
+>>> CONTINUE FROM HERE <<<""",
 
-    # 截断结尾保留字符数（用于续传提示）
-    "truncated_ending_chars": 500,
+    # 截断结尾保留字符数（用于续传提示）- 增加以提供更多上下文
+    "truncated_ending_chars": 800,
 
     # 续传请求的 max_tokens（确保有足够空间完成）
-    "continuation_max_tokens": 16192,
+    "continuation_max_tokens": 16384,
 
     # 日志级别
     "log_continuations": True,
+
+    # 智能合并配置
+    "smart_merge": {
+        "detect_overlap": True,          # 检测重叠内容
+        "max_overlap_check": 200,        # 最大重叠检查长度
+        "json_boundary_aware": True,     # JSON 边界感知
+    },
 }
 
 # 历史消息管理配置
@@ -1372,25 +1377,34 @@ def escape_json_string_newlines(json_str: str) -> str:
     return ''.join(result)
 
 
-def _try_parse_json(json_str: str, end_pos: int) -> tuple[dict, int]:
-    """尝试多种方式解析 JSON 字符串
+def _try_parse_json(json_str: str, end_pos: int, silent: bool = False) -> tuple[dict, int]:
+    """尝试多种方式解析 JSON 字符串 - 优化版
 
     Args:
         json_str: JSON 字符串
         end_pos: 成功时返回的结束位置
+        silent: 是否静默模式（不记录调试日志）
 
     Returns:
         (parsed_json, end_position) 或抛出异常
     """
     import re
 
-    # 直接解析
+    # 策略 0: 直接解析（最快路径）
     try:
         return json.loads(json_str), end_pos
     except json.JSONDecodeError:
         pass
 
-    # 修复策略 1: 移除尾随逗号
+    # 策略 1: 使用 JSONDecoder 提取有效部分（处理尾部垃圾）
+    try:
+        decoder = json.JSONDecoder()
+        obj, idx = decoder.raw_decode(json_str.lstrip())
+        return obj, end_pos
+    except json.JSONDecodeError:
+        pass
+
+    # 策略 2: 移除尾随逗号
     try:
         fixed = re.sub(r',\s*}', '}', json_str)
         fixed = re.sub(r',\s*]', ']', fixed)
@@ -1398,14 +1412,14 @@ def _try_parse_json(json_str: str, end_pos: int) -> tuple[dict, int]:
     except json.JSONDecodeError:
         pass
 
-    # 修复策略 2: 转义字符串内的控制字符
+    # 策略 3: 转义字符串内的控制字符
     try:
         fixed = escape_json_string_newlines(json_str)
         return json.loads(fixed), end_pos
     except json.JSONDecodeError:
         pass
 
-    # 修复策略 3: 组合修复
+    # 策略 4: 组合修复（转义 + 移除尾随逗号）
     try:
         fixed = escape_json_string_newlines(json_str)
         fixed = re.sub(r',\s*}', '}', fixed)
@@ -1414,35 +1428,84 @@ def _try_parse_json(json_str: str, end_pos: int) -> tuple[dict, int]:
     except json.JSONDecodeError:
         pass
 
-    # 修复策略 4: 处理截断的字符串值
-    # 如果 JSON 在字符串中间被截断，尝试闭合
+    # 策略 5: 智能闭合截断的 JSON
     try:
-        # 检查未闭合的引号
-        quote_count = json_str.count('"') - json_str.count('\\"')
-        if quote_count % 2 == 1:
-            # 奇数个引号，尝试闭合
-            fixed = json_str.rstrip()
-            if not fixed.endswith('"'):
-                fixed = fixed + '"'
-            # 检查是否需要闭合对象
-            open_braces = fixed.count('{') - fixed.count('}')
-            if open_braces > 0:
-                fixed = fixed + '}' * open_braces
+        fixed = _smart_close_json(json_str)
+        if fixed:
             return json.loads(fixed), end_pos
     except json.JSONDecodeError:
         pass
 
-    # 修复策略 5: 提取有效的 JSON 子集
-    # 尝试找到最长的有效 JSON 前缀
-    try:
-        # 使用 json.JSONDecoder 来找到有效部分
-        decoder = json.JSONDecoder()
-        obj, idx = decoder.raw_decode(json_str)
-        return obj, end_pos
-    except json.JSONDecodeError:
-        pass
+    # 策略 6: 渐进式截断尝试（从后向前找有效 JSON）
+    # 只在其他策略都失败时使用
+    for trim_len in [10, 50, 100, 200]:
+        if len(json_str) > trim_len:
+            try:
+                trimmed = json_str[:-trim_len].rstrip()
+                # 尝试智能闭合
+                closed = _smart_close_json(trimmed)
+                if closed:
+                    result = json.loads(closed)
+                    if not silent:
+                        logger.debug(f"JSON recovered by trimming {trim_len} chars")
+                    return result, end_pos
+            except:
+                continue
 
     raise json.JSONDecodeError("Failed to parse JSON after all recovery attempts", json_str, 0)
+
+
+def _smart_close_json(json_str: str) -> str:
+    """智能闭合不完整的 JSON 字符串
+
+    分析 JSON 结构，尝试正确闭合未完成的字符串、数组和对象
+    """
+    if not json_str or not json_str.strip():
+        return None
+
+    s = json_str.rstrip()
+
+    # 分析结构
+    in_string = False
+    escape = False
+    stack = []  # 存储 '{' 或 '['
+
+    for c in s:
+        if escape:
+            escape = False
+            continue
+        if c == '\\' and in_string:
+            escape = True
+            continue
+        if c == '"' and not escape:
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if c == '{':
+            stack.append('{')
+        elif c == '[':
+            stack.append('[')
+        elif c == '}':
+            if stack and stack[-1] == '{':
+                stack.pop()
+        elif c == ']':
+            if stack and stack[-1] == '[':
+                stack.pop()
+
+    # 如果在字符串内部，先闭合字符串
+    if in_string:
+        s = s + '"'
+
+    # 闭合未完成的结构
+    while stack:
+        bracket = stack.pop()
+        if bracket == '{':
+            s = s + '}'
+        elif bracket == '[':
+            s = s + ']'
+
+    return s
 
 
 def extract_json_from_position(text: str, start: int) -> tuple[dict, int]:
@@ -1521,8 +1584,8 @@ def extract_json_from_position(text: str, start: int) -> tuple[dict, int]:
             incomplete_json = incomplete_json + close_brackets
 
         try:
-            result = _try_parse_json(incomplete_json, len(text))
-            logger.warning(f"JSON was incomplete (depth={depth}), auto-closed successfully")
+            result = _try_parse_json(incomplete_json, len(text), silent=True)
+            logger.debug(f"JSON was incomplete (depth={depth}), auto-closed successfully")
             return result
         except (json.JSONDecodeError, ValueError):
             pass
@@ -1534,8 +1597,8 @@ def extract_json_from_position(text: str, start: int) -> tuple[dict, int]:
         if search_text[i] == '}':
             try_json = search_text[:i + 1]
             try:
-                result = _try_parse_json(try_json, json_start + i + 1)
-                logger.warning(f"JSON was truncated, found valid endpoint at position {i}")
+                result = _try_parse_json(try_json, json_start + i + 1, silent=True)
+                logger.debug(f"JSON was truncated, found valid endpoint at position {i}")
                 return result
             except (json.JSONDecodeError, ValueError):
                 continue
@@ -1613,7 +1676,7 @@ def parse_inline_tool_calls(text: str) -> tuple[list, str]:
 
             except (ValueError, json.JSONDecodeError) as e:
                 # JSON 解析失败，尝试更智能的提取
-                logger.warning(f"JSON parse failed for tool {tool_name}: {e}")
+                logger.debug(f"JSON initial parse failed for tool {tool_name}, trying recovery: {e}")
 
                 # 尝试提取到下一个 [Calling tool: 或文本结尾
                 next_tool = re.search(r'\[Calling tool:', after_match[input_match.end():])
@@ -1703,7 +1766,7 @@ def parse_inline_tool_calls(text: str) -> tuple[list, str]:
                     continue
 
                 # 如果所有方法都失败，作为 raw_input 处理（保留更多信息用于调试）
-                logger.warning(f"Tool {tool_name}: All JSON parse attempts failed, using raw input")
+                logger.info(f"Tool {tool_name}: JSON recovery failed, using raw input for continuation")
                 tool_id = f"toolu_{uuid.uuid4().hex[:12]}"
 
                 # 尝试提取有意义的部分
@@ -1762,6 +1825,37 @@ def parse_inline_tool_calls(text: str) -> tuple[list, str]:
 
 # ==================== 智能接续机制 ====================
 
+def _count_json_braces(text: str) -> tuple[int, int]:
+    """精确计数 JSON 括号，排除字符串内的括号
+
+    Returns:
+        (open_braces, close_braces) - 实际的开闭括号数量
+    """
+    open_count = 0
+    close_count = 0
+    in_string = False
+    escape = False
+
+    for c in text:
+        if escape:
+            escape = False
+            continue
+        if c == '\\' and in_string:
+            escape = True
+            continue
+        if c == '"' and not escape:
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if c == '{':
+            open_count += 1
+        elif c == '}':
+            close_count += 1
+
+    return open_count, close_count
+
+
 class TruncationInfo:
     """截断信息封装类"""
     def __init__(self):
@@ -1796,13 +1890,13 @@ def detect_truncation(full_text: str, stream_completed: bool, finish_reason: str
     if not stream_completed:
         info.is_truncated = True
         info.reason = "stream_interrupted"
-        logger.warning(f"[{request_id}] 截断检测: 流未正常完成")
+        logger.info(f"[{request_id}] 截断检测: 流未正常完成，将触发续传")
 
     # 检测2: finish_reason 表示达到上限
     if finish_reason in ("max_tokens", "length"):
         info.is_truncated = True
         info.reason = "max_tokens_reached"
-        logger.warning(f"[{request_id}] 截断检测: finish_reason={finish_reason}")
+        logger.info(f"[{request_id}] 截断检测: finish_reason={finish_reason}，将触发续传")
 
     # 检测3: 代码块未闭合检测（重要！针对普通代码输出）
     code_fence_count = full_text.count("```")
@@ -1811,16 +1905,15 @@ def detect_truncation(full_text: str, stream_completed: bool, finish_reason: str
         if not info.is_truncated:
             info.is_truncated = True
             info.reason = f"incomplete_code_block (fence_count: {code_fence_count})"
-            logger.warning(f"[{request_id}] 截断检测: 代码块未闭合 - {code_fence_count} 个 ``` 标记")
+            logger.info(f"[{request_id}] 截断检测: 代码块未闭合 ({code_fence_count} 个 ``` 标记)")
 
-    # 检测4: 工具调用 JSON 括号不匹配
+    # 检测4: 工具调用 JSON 括号不匹配（精确计数，排除字符串内的括号）
     if "[Calling tool:" in full_text:
-        open_braces = full_text.count('{')
-        close_braces = full_text.count('}')
+        open_braces, close_braces = _count_json_braces(full_text)
         if open_braces > close_braces:
             info.is_truncated = True
             info.reason = f"incomplete_json (braces: {open_braces} open, {close_braces} close)"
-            logger.warning(f"[{request_id}] 截断检测: JSON括号不匹配 - {info.reason}")
+            logger.info(f"[{request_id}] 截断检测: JSON括号不匹配 ({open_braces} open, {close_braces} close)")
 
     # 解析工具调用
     tool_uses, remaining_text = parse_inline_tool_calls(full_text)
@@ -1833,7 +1926,7 @@ def detect_truncation(full_text: str, stream_completed: bool, finish_reason: str
             if not info.is_truncated:
                 info.is_truncated = True
                 info.reason = f"tool_parse_error in {tu.get('name', 'unknown')}"
-                logger.warning(f"[{request_id}] 截断检测: 工具解析失败 - {tu.get('name')}")
+                logger.info(f"[{request_id}] 截断检测: 工具 {tu.get('name')} 解析不完整，将触发续传")
         else:
             info.valid_tool_uses.append(tu)
 
@@ -1861,7 +1954,7 @@ def detect_truncation(full_text: str, stream_completed: bool, finish_reason: str
             if re.search(pattern, last_100_chars, re.IGNORECASE):
                 info.is_truncated = True
                 info.reason = f"incomplete_statement (pattern: {pattern[:30]}...)"
-                logger.warning(f"[{request_id}] 截断检测: 语句未完成 - {info.reason}")
+                logger.debug(f"[{request_id}] 截断检测: 语句未完成 - {info.reason}")
                 break
 
     return info
@@ -1922,44 +2015,91 @@ def build_continuation_request(
 
 
 def merge_responses(original_text: str, continuation_text: str, request_id: str) -> str:
-    """合并原始响应和续传响应
+    """合并原始响应和续传响应 - 优化版
 
     策略：
-    1. 检测续传响应是否有重复内容
-    2. 智能拼接，避免重复
-    3. 处理 JSON 边界情况
+    1. 多层重叠检测（精确匹配 + 模糊匹配）
+    2. JSON 边界感知拼接
+    3. 代码块边界处理
+    4. 工具调用边界处理
     """
     if not continuation_text:
         return original_text
 
-    # 清理续传响应开头可能的重复内容
-    continuation_clean = continuation_text.strip()
+    config = CONTINUATION_CONFIG.get("smart_merge", {})
+    max_overlap = config.get("max_overlap_check", 200)
 
-    # 检查是否有明显的重复（续传响应以原始结尾开始）
-    overlap_check_len = min(100, len(original_text))
-    original_ending = original_text[-overlap_check_len:]
+    continuation_clean = continuation_text
 
-    # 查找重叠
-    for i in range(len(original_ending), 0, -1):
-        if continuation_clean.startswith(original_ending[-i:]):
-            # 找到重叠，去除重复部分
-            continuation_clean = continuation_clean[i:]
-            logger.info(f"[{request_id}] 合并响应: 检测到 {i} 字符重叠，已去除")
-            break
+    # ========== 第一层：精确重叠检测 ==========
+    overlap_found = 0
+    overlap_check_len = min(max_overlap, len(original_text), len(continuation_clean))
 
-    # 智能拼接
-    # 检查原始文本是否在 JSON 中间被截断
-    if original_text.rstrip().endswith((',', ':', '"', '{', '[')):
-        # JSON 中间截断，直接拼接
+    if overlap_check_len > 10:
+        original_ending = original_text[-overlap_check_len:]
+
+        # 从长到短查找重叠
+        for i in range(overlap_check_len, 5, -1):
+            suffix = original_ending[-i:]
+            if continuation_clean.startswith(suffix):
+                overlap_found = i
+                continuation_clean = continuation_clean[i:]
+                break
+
+    # ========== 第二层：模糊重叠检测（处理轻微差异）==========
+    if overlap_found == 0 and len(original_text) > 50 and len(continuation_clean) > 50:
+        # 检查续传是否以原文的某个片段开始（可能有轻微格式差异）
+        original_last_50 = original_text[-50:].strip()
+        cont_first_100 = continuation_clean[:100]
+
+        # 查找原文结尾在续传开头的位置
+        for check_len in [40, 30, 20, 15]:
+            if check_len > len(original_last_50):
+                continue
+            snippet = original_last_50[-check_len:]
+            pos = cont_first_100.find(snippet)
+            if pos != -1 and pos < 60:  # 在前60字符内找到
+                # 找到重叠，从重叠结束位置开始
+                overlap_found = pos + check_len
+                continuation_clean = continuation_clean[overlap_found:]
+                break
+
+    if overlap_found > 0:
+        logger.debug(f"[{request_id}] 合并响应: 检测到 {overlap_found} 字符重叠")
+
+    # ========== 第三层：智能边界拼接 ==========
+    original_stripped = original_text.rstrip()
+    cont_stripped = continuation_clean.lstrip()
+
+    # 检测原文结尾类型
+    last_char = original_stripped[-1:] if original_stripped else ''
+
+    # JSON 中间截断 - 直接拼接
+    if last_char in (',', ':', '"', '{', '[', '\\'):
         merged = original_text + continuation_clean
-    elif original_text.rstrip()[-1:] in ('}', ']', '"') and continuation_clean.startswith((',', '}', ']')):
-        # JSON 结构边界，直接拼接
+    # JSON 结构边界
+    elif last_char in ('}', ']') and cont_stripped and cont_stripped[0] in (',', '}', ']', '\n'):
         merged = original_text + continuation_clean
+    # 代码块中间截断
+    elif '```' in original_text[-200:] and original_text.count('```') % 2 == 1:
+        # 在未闭合的代码块中，直接拼接
+        merged = original_text + continuation_clean
+    # 工具调用中间截断
+    elif original_text.rstrip().endswith('Input:') or 'Input: {' in original_text[-100:]:
+        merged = original_text + continuation_clean
+    # 普通文本 - 检查是否需要换行
+    elif last_char in ('.', '!', '?', '\n'):
+        # 句子结束，可能需要换行
+        if not continuation_clean.startswith('\n') and not original_text.endswith('\n'):
+            merged = original_text + '\n' + continuation_clean
+        else:
+            merged = original_text + continuation_clean
     else:
-        # 其他情况，可能需要空格分隔
+        # 默认直接拼接
         merged = original_text + continuation_clean
 
-    logger.info(f"[{request_id}] 合并响应: 原始={len(original_text)}, 续传={len(continuation_text)}, 合并后={len(merged)}")
+    logger.info(f"[{request_id}] 合并响应: 原始={len(original_text)}, 续传={len(continuation_text)}, "
+                f"重叠={overlap_found}, 合并后={len(merged)}")
 
     return merged
 
