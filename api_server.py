@@ -44,53 +44,45 @@ CONTINUATION_CONFIG = {
     # 启用接续机制
     "enabled": True,
 
-    # 最大续传次数（防止无限循环）- 增加到 8 次以处理超长响应
-    "max_continuations": 8,
+    # 最大续传次数（防止无限循环）
+    "max_continuations": 3,
 
-    # 触发续传的条件（按优先级）
+    # 触发续传的条件
     "triggers": {
-        # 高优先级 - 明确的截断信号
-        "stream_interrupted": True,      # 流中断（EOF/连接断开）
-        "max_tokens_reached": True,      # max_tokens 达到上限
-        "incomplete_tool_json": True,    # 工具调用 JSON 不完整
-
-        # 中优先级 - 结构性问题
-        "parse_error": True,             # 解析错误
-        "incomplete_code_block": True,   # 代码块未闭合
-
-        # 低优先级 - 启发式检测（更保守，避免误报）
-        "incomplete_statement": False,   # 禁用语句检测（误报太多）
+        # 流中断（EOF/连接断开）
+        "stream_interrupted": True,
+        # max_tokens 达到上限
+        "max_tokens_reached": True,
+        # 工具调用 JSON 不完整
+        "incomplete_tool_json": True,
+        # 解析错误
+        "parse_error": True,
     },
 
-    # 续传提示词模板 - 优化版，更精准的指令
-    "continuation_prompt": """CONTINUE OUTPUT - Your response was cut off mid-stream.
+    # 续传提示词模板
+    "continuation_prompt": """Your previous response was truncated. Please continue EXACTLY from where you stopped.
 
-CRITICAL RULES:
-1. Resume EXACTLY where you stopped - no repetition
-2. If mid-JSON: complete the JSON structure
-3. If mid-code: complete the code block
-4. NO preambles, NO explanations, just continue
+IMPORTANT:
+- Do NOT repeat any content you already generated
+- Do NOT add any preamble or explanation
+- Continue the JSON/tool call from the exact character where it was cut off
+- If you were in the middle of a tool call, complete it properly
 
-Last output fragment:
+Your truncated response ended with:
+```
 {truncated_ending}
+```
 
->>> CONTINUE FROM HERE <<<""",
+Continue from here:""",
 
-    # 截断结尾保留字符数（用于续传提示）- 增加以提供更多上下文
-    "truncated_ending_chars": 800,
+    # 截断结尾保留字符数（用于续传提示）
+    "truncated_ending_chars": 500,
 
     # 续传请求的 max_tokens（确保有足够空间完成）
-    "continuation_max_tokens": 16384,
+    "continuation_max_tokens": 8192,
 
     # 日志级别
     "log_continuations": True,
-
-    # 智能合并配置
-    "smart_merge": {
-        "detect_overlap": True,          # 检测重叠内容
-        "max_overlap_check": 200,        # 最大重叠检查长度
-        "json_boundary_aware": True,     # JSON 边界感知
-    },
 }
 
 # 历史消息管理配置
@@ -140,55 +132,54 @@ MODEL_ROUTING_CONFIG = {
     "force_opus_on_thinking": True,
 
     # 主 Agent 请求（非子 Agent）- 更高概率用 Opus
-    "main_agent_opus_probability": 35,  # 主 Agent 35% 概率用 Opus（平衡质量与并发）
+    "main_agent_opus_probability": 60,  # 主 Agent 60% 概率用 Opus
 
     # ============================================================
     # 第一优先级：强制 Opus 的关键词（最后一条用户消息包含）
-    # 仅保留真正需要深度思考的核心任务（精简版，提升并发）
+    # 这些是真正需要深度思考的任务
     # ============================================================
     "force_opus_keywords": [
-        # 完整项目创建 - 需要架构思维
-        "创建项目", "新建项目", "初始化项目",
+        # 创建类 - 完整的创建任务
+        "创建项目", "新建项目", "初始化项目", "搭建项目",
         "create project", "new project", "init project",
-        # 系统架构设计 - 需要深度推理
-        "系统设计", "架构设计", "设计架构",
-        "system design", "architecture design", "design architecture",
-        # 大规模重构 - 需要全局视角
-        "整体重构", "大规模重构", "complete refactor",
-        # 战略规划 - 需要深度思考
-        "整体规划", "系统规划", "战略规划",
+        # 设计架构类 - 需要架构思维
+        "设计架构", "系统设计", "架构设计", "方案设计", "设计",
+        "design architecture", "system design", "architecture design", "design",
+        # 深度分析类
+        "分析", "梳理", "检查问题", "全面分析", "详细分析", "根因分析", "诊断",
+        "analysis", "analyze", "diagnose", "investigate",
+        # 重构类 - 大规模重构
+        "重构", "整体重构", "大规模重构",
+        "refactor", "major refactor", "complete refactor",
+        # 规划类
+        "规划", "整体规划", "系统规划", "战略规划", "计划",
+        "plan", "planning", "strategy",
+        # Agent/Task 调用相关
+        "UI-UX", "ui-ux", "UI设计", "设计稿",
     ],
 
     # ============================================================
     # 第二优先级：强制 Sonnet 的关键词（执行性任务）
-    # 扩充版，覆盖更多常见操作以提升并发
     # ============================================================
     "force_sonnet_keywords": [
-        # 简单查看操作
-        "看看", "显示", "列出", "打开", "查看", "确认",
-        "show", "list", "display", "view", "open", "check", "verify", "confirm",
-        # 小改动和修复
-        "修复", "调整", "更新", "改一下", "改成", "优化", "改进", "调优",
-        "fix", "adjust", "update", "optimize", "improve", "tune",
+        # 简单操作
+        "看看", "显示", "列出", "打开",
+        "show", "list", "display", "view", "open",
+        # 小改动
+        "修复", "调整", "更新", "改一下", "改成",
+        "fix", "adjust", "update",
         # 执行命令
-        "运行", "执行", "启动", "重启", "停止", "部署", "发布",
-        "run", "execute", "start", "restart", "stop", "deploy", "release",
+        "运行", "执行", "启动", "重启", "停止",
+        "run", "execute", "start", "restart", "stop",
         # 简单问答
         "什么是", "哪里", "是不是", "有没有",
         "what is", "where", "is it", "do you",
-        # 读取和搜索
-        "读取", "获取", "搜索", "查找",
+        # 读取类
+        "读取", "获取", "搜索",
         "read", "get", "search", "find",
-        # 安装和配置
-        "安装", "下载", "配置", "设置",
-        "install", "download", "configure", "setup",
-        # 调试和测试
-        "调试", "测试", "debug", "test",
-        # 日志分析（非深度）
-        "分析日志", "看日志", "analyze log", "check log",
-        # 普通级别操作（非架构级）
-        "小重构", "局部重构", "minor refactor",
-        "简单设计", "页面设计", "UI调整",
+        # 安装类
+        "安装", "下载",
+        "install", "download",
     ],
 
     # ============================================================
@@ -196,31 +187,24 @@ MODEL_ROUTING_CONFIG = {
     # ============================================================
 
     # 首轮对话检测 - 新任务开始需要一定概率 Opus
-    "first_turn_opus_probability": 50,    # 首轮 50% 概率用 Opus（平衡质量与并发）
+    "first_turn_opus_probability": 90,    # 首轮 50% 概率用 Opus
 
     # 用户消息数阈值（不含 system）- 判断是否为首轮
     "first_turn_max_user_messages": 2,    # <= 2 条用户消息视为首轮
 
     # 工具执行阶段检测 - 大量工具调用说明在执行阶段
     "execution_phase_tool_calls": 5,      # 工具调用 >= 5 次视为执行阶段
-    "execution_phase_sonnet_probability": 85,  # 执行阶段 85% 用 Sonnet（提升以增加并发）
+    "execution_phase_sonnet_probability": 80,  # 执行阶段 90% 用 Sonnet
 
     # ============================================================
-    # 第四优先级：保底概率（确保 20-25% Opus 使用率）
+    # 第四优先级：保底概率（确保 10-20% Opus 使用率）
     # ============================================================
-    "base_opus_probability": 15,          # 基础 15% 概率使用 Opus（平衡质量与并发）
+    "base_opus_probability": 30,          # 基础 15% 概率使用 Opus
 
     # ============================================================
     # 调试和监控
     # ============================================================
     "log_routing_decision": True,         # 记录路由决策原因
-
-    # ============================================================
-    # 白名单机制 - 强制使用 Opus
-    # ============================================================
-    "whitelist_enabled": True,            # 启用白名单机制
-    "whitelist_header": "X-Force-Model",  # 请求头名称
-    "whitelist_marker": "[FORCE_OPUS]",   # 消息中的标记
 }
 
 
@@ -442,37 +426,14 @@ class ModelRouter:
         else:
             return False, f"默认Sonnet(msg={user_msg_count},tools={tool_calls})"
 
-    def route(self, request_body: dict, request_headers: dict = None) -> tuple[str, str]:
+    def route(self, request_body: dict) -> tuple[str, str]:
         """
         路由到合适的模型
-
-        Args:
-            request_body: 请求体
-            request_headers: 请求头（用于白名单检测）
 
         Returns:
             (routed_model, reason)
         """
         original_model = request_body.get("model", "")
-
-        # ============================================================
-        # 白名单检测 - 最高优先级
-        # ============================================================
-        if self.config.get("whitelist_enabled", True):
-            # 检查请求头
-            if request_headers:
-                force_header = self.config.get("whitelist_header", "X-Force-Model")
-                if request_headers.get(force_header, "").lower() == "opus":
-                    self.stats["opus"] += 1
-                    return self.config.get("opus_model", "claude-opus-4-5-20251101"), "白名单[请求头]"
-
-            # 检查消息中的标记
-            whitelist_marker = self.config.get("whitelist_marker", "[FORCE_OPUS]")
-            messages = request_body.get("messages", [])
-            last_user_msg = self._get_last_user_message(messages)
-            if whitelist_marker in last_user_msg:
-                self.stats["opus"] += 1
-                return self.config.get("opus_model", "claude-opus-4-5-20251101"), "白名单[标记]"
 
         # 只处理 Opus 请求
         if "opus" not in original_model.lower():
@@ -640,7 +601,7 @@ async def call_kiro_for_summary(prompt: str) -> str:
     """调用 Kiro API 生成摘要 - 使用全局 HTTP 客户端"""
     summary_id = uuid.uuid4().hex[:8]
     request_body = {
-        "model": "claude-haiku-4-5-20251001",  # 使用快速模型
+        "model": "claude-haiku-4",  # 使用快速模型
         "messages": [{"role": "user", "content": prompt}],
         "stream": False,
         "max_tokens": 2000,
@@ -1226,7 +1187,7 @@ def convert_anthropic_to_openai(anthropic_body: dict) -> dict:
 
     # 构建 OpenAI 请求
     openai_body = {
-        "model": anthropic_body.get("model", "claude-sonnet-4-5-20250929"),
+        "model": anthropic_body.get("model", "claude-sonnet-4"),
         "messages": messages,
         "stream": anthropic_body.get("stream", False),
     }
@@ -1377,34 +1338,25 @@ def escape_json_string_newlines(json_str: str) -> str:
     return ''.join(result)
 
 
-def _try_parse_json(json_str: str, end_pos: int, silent: bool = False) -> tuple[dict, int]:
-    """尝试多种方式解析 JSON 字符串 - 优化版
+def _try_parse_json(json_str: str, end_pos: int) -> tuple[dict, int]:
+    """尝试多种方式解析 JSON 字符串
 
     Args:
         json_str: JSON 字符串
         end_pos: 成功时返回的结束位置
-        silent: 是否静默模式（不记录调试日志）
 
     Returns:
         (parsed_json, end_position) 或抛出异常
     """
     import re
 
-    # 策略 0: 直接解析（最快路径）
+    # 直接解析
     try:
         return json.loads(json_str), end_pos
     except json.JSONDecodeError:
         pass
 
-    # 策略 1: 使用 JSONDecoder 提取有效部分（处理尾部垃圾）
-    try:
-        decoder = json.JSONDecoder()
-        obj, idx = decoder.raw_decode(json_str.lstrip())
-        return obj, end_pos
-    except json.JSONDecodeError:
-        pass
-
-    # 策略 2: 移除尾随逗号
+    # 修复策略 1: 移除尾随逗号
     try:
         fixed = re.sub(r',\s*}', '}', json_str)
         fixed = re.sub(r',\s*]', ']', fixed)
@@ -1412,14 +1364,14 @@ def _try_parse_json(json_str: str, end_pos: int, silent: bool = False) -> tuple[
     except json.JSONDecodeError:
         pass
 
-    # 策略 3: 转义字符串内的控制字符
+    # 修复策略 2: 转义字符串内的控制字符
     try:
         fixed = escape_json_string_newlines(json_str)
         return json.loads(fixed), end_pos
     except json.JSONDecodeError:
         pass
 
-    # 策略 4: 组合修复（转义 + 移除尾随逗号）
+    # 修复策略 3: 组合修复
     try:
         fixed = escape_json_string_newlines(json_str)
         fixed = re.sub(r',\s*}', '}', fixed)
@@ -1428,84 +1380,35 @@ def _try_parse_json(json_str: str, end_pos: int, silent: bool = False) -> tuple[
     except json.JSONDecodeError:
         pass
 
-    # 策略 5: 智能闭合截断的 JSON
+    # 修复策略 4: 处理截断的字符串值
+    # 如果 JSON 在字符串中间被截断，尝试闭合
     try:
-        fixed = _smart_close_json(json_str)
-        if fixed:
+        # 检查未闭合的引号
+        quote_count = json_str.count('"') - json_str.count('\\"')
+        if quote_count % 2 == 1:
+            # 奇数个引号，尝试闭合
+            fixed = json_str.rstrip()
+            if not fixed.endswith('"'):
+                fixed = fixed + '"'
+            # 检查是否需要闭合对象
+            open_braces = fixed.count('{') - fixed.count('}')
+            if open_braces > 0:
+                fixed = fixed + '}' * open_braces
             return json.loads(fixed), end_pos
     except json.JSONDecodeError:
         pass
 
-    # 策略 6: 渐进式截断尝试（从后向前找有效 JSON）
-    # 只在其他策略都失败时使用
-    for trim_len in [10, 50, 100, 200]:
-        if len(json_str) > trim_len:
-            try:
-                trimmed = json_str[:-trim_len].rstrip()
-                # 尝试智能闭合
-                closed = _smart_close_json(trimmed)
-                if closed:
-                    result = json.loads(closed)
-                    if not silent:
-                        logger.debug(f"JSON recovered by trimming {trim_len} chars")
-                    return result, end_pos
-            except:
-                continue
+    # 修复策略 5: 提取有效的 JSON 子集
+    # 尝试找到最长的有效 JSON 前缀
+    try:
+        # 使用 json.JSONDecoder 来找到有效部分
+        decoder = json.JSONDecoder()
+        obj, idx = decoder.raw_decode(json_str)
+        return obj, end_pos
+    except json.JSONDecodeError:
+        pass
 
     raise json.JSONDecodeError("Failed to parse JSON after all recovery attempts", json_str, 0)
-
-
-def _smart_close_json(json_str: str) -> str:
-    """智能闭合不完整的 JSON 字符串
-
-    分析 JSON 结构，尝试正确闭合未完成的字符串、数组和对象
-    """
-    if not json_str or not json_str.strip():
-        return None
-
-    s = json_str.rstrip()
-
-    # 分析结构
-    in_string = False
-    escape = False
-    stack = []  # 存储 '{' 或 '['
-
-    for c in s:
-        if escape:
-            escape = False
-            continue
-        if c == '\\' and in_string:
-            escape = True
-            continue
-        if c == '"' and not escape:
-            in_string = not in_string
-            continue
-        if in_string:
-            continue
-        if c == '{':
-            stack.append('{')
-        elif c == '[':
-            stack.append('[')
-        elif c == '}':
-            if stack and stack[-1] == '{':
-                stack.pop()
-        elif c == ']':
-            if stack and stack[-1] == '[':
-                stack.pop()
-
-    # 如果在字符串内部，先闭合字符串
-    if in_string:
-        s = s + '"'
-
-    # 闭合未完成的结构
-    while stack:
-        bracket = stack.pop()
-        if bracket == '{':
-            s = s + '}'
-        elif bracket == '[':
-            s = s + ']'
-
-    return s
 
 
 def extract_json_from_position(text: str, start: int) -> tuple[dict, int]:
@@ -1584,8 +1487,8 @@ def extract_json_from_position(text: str, start: int) -> tuple[dict, int]:
             incomplete_json = incomplete_json + close_brackets
 
         try:
-            result = _try_parse_json(incomplete_json, len(text), silent=True)
-            logger.debug(f"JSON was incomplete (depth={depth}), auto-closed successfully")
+            result = _try_parse_json(incomplete_json, len(text))
+            logger.warning(f"JSON was incomplete (depth={depth}), auto-closed successfully")
             return result
         except (json.JSONDecodeError, ValueError):
             pass
@@ -1597,8 +1500,8 @@ def extract_json_from_position(text: str, start: int) -> tuple[dict, int]:
         if search_text[i] == '}':
             try_json = search_text[:i + 1]
             try:
-                result = _try_parse_json(try_json, json_start + i + 1, silent=True)
-                logger.debug(f"JSON was truncated, found valid endpoint at position {i}")
+                result = _try_parse_json(try_json, json_start + i + 1)
+                logger.warning(f"JSON was truncated, found valid endpoint at position {i}")
                 return result
             except (json.JSONDecodeError, ValueError):
                 continue
@@ -1676,7 +1579,7 @@ def parse_inline_tool_calls(text: str) -> tuple[list, str]:
 
             except (ValueError, json.JSONDecodeError) as e:
                 # JSON 解析失败，尝试更智能的提取
-                logger.debug(f"JSON initial parse failed for tool {tool_name}, trying recovery: {e}")
+                logger.warning(f"JSON parse failed for tool {tool_name}: {e}")
 
                 # 尝试提取到下一个 [Calling tool: 或文本结尾
                 next_tool = re.search(r'\[Calling tool:', after_match[input_match.end():])
@@ -1766,7 +1669,7 @@ def parse_inline_tool_calls(text: str) -> tuple[list, str]:
                     continue
 
                 # 如果所有方法都失败，作为 raw_input 处理（保留更多信息用于调试）
-                logger.info(f"Tool {tool_name}: JSON recovery failed, using raw input for continuation")
+                logger.warning(f"Tool {tool_name}: All JSON parse attempts failed, using raw input")
                 tool_id = f"toolu_{uuid.uuid4().hex[:12]}"
 
                 # 尝试提取有意义的部分
@@ -1825,37 +1728,6 @@ def parse_inline_tool_calls(text: str) -> tuple[list, str]:
 
 # ==================== 智能接续机制 ====================
 
-def _count_json_braces(text: str) -> tuple[int, int]:
-    """精确计数 JSON 括号，排除字符串内的括号
-
-    Returns:
-        (open_braces, close_braces) - 实际的开闭括号数量
-    """
-    open_count = 0
-    close_count = 0
-    in_string = False
-    escape = False
-
-    for c in text:
-        if escape:
-            escape = False
-            continue
-        if c == '\\' and in_string:
-            escape = True
-            continue
-        if c == '"' and not escape:
-            in_string = not in_string
-            continue
-        if in_string:
-            continue
-        if c == '{':
-            open_count += 1
-        elif c == '}':
-            close_count += 1
-
-    return open_count, close_count
-
-
 class TruncationInfo:
     """截断信息封装类"""
     def __init__(self):
@@ -1877,9 +1749,8 @@ def detect_truncation(full_text: str, stream_completed: bool, finish_reason: str
     检测策略：
     1. 流未正常完成（EOF/连接中断）
     2. finish_reason 是 max_tokens 或 length
-    3. 代码块未闭合（``` 括号不匹配）
-    4. 工具调用 JSON 括号不匹配
-    5. 工具调用解析失败
+    3. 工具调用 JSON 括号不匹配
+    4. 工具调用解析失败
     """
     info = TruncationInfo()
     info.truncated_text = full_text
@@ -1890,35 +1761,27 @@ def detect_truncation(full_text: str, stream_completed: bool, finish_reason: str
     if not stream_completed:
         info.is_truncated = True
         info.reason = "stream_interrupted"
-        logger.info(f"[{request_id}] 截断检测: 流未正常完成，将触发续传")
+        logger.warning(f"[{request_id}] 截断检测: 流未正常完成")
 
     # 检测2: finish_reason 表示达到上限
     if finish_reason in ("max_tokens", "length"):
         info.is_truncated = True
         info.reason = "max_tokens_reached"
-        logger.info(f"[{request_id}] 截断检测: finish_reason={finish_reason}，将触发续传")
+        logger.warning(f"[{request_id}] 截断检测: finish_reason={finish_reason}")
 
-    # 检测3: 代码块未闭合检测（重要！针对普通代码输出）
-    code_fence_count = full_text.count("```")
-    if code_fence_count % 2 != 0:
-        # 奇数个 ``` 表示有未闭合的代码块
-        if not info.is_truncated:
-            info.is_truncated = True
-            info.reason = f"incomplete_code_block (fence_count: {code_fence_count})"
-            logger.info(f"[{request_id}] 截断检测: 代码块未闭合 ({code_fence_count} 个 ``` 标记)")
-
-    # 检测4: 工具调用 JSON 括号不匹配（精确计数，排除字符串内的括号）
+    # 检测3: 工具调用 JSON 括号不匹配
     if "[Calling tool:" in full_text:
-        open_braces, close_braces = _count_json_braces(full_text)
+        open_braces = full_text.count('{')
+        close_braces = full_text.count('}')
         if open_braces > close_braces:
             info.is_truncated = True
             info.reason = f"incomplete_json (braces: {open_braces} open, {close_braces} close)"
-            logger.info(f"[{request_id}] 截断检测: JSON括号不匹配 ({open_braces} open, {close_braces} close)")
+            logger.warning(f"[{request_id}] 截断检测: JSON括号不匹配 - {info.reason}")
 
     # 解析工具调用
     tool_uses, remaining_text = parse_inline_tool_calls(full_text)
 
-    # 检测5: 检查解析结果中是否有错误
+    # 检测4: 检查解析结果中是否有错误
     for tu in tool_uses:
         inp = tu.get("input", {})
         if isinstance(inp, dict) and ("_parse_error" in inp or "_raw" in inp):
@@ -1926,36 +1789,9 @@ def detect_truncation(full_text: str, stream_completed: bool, finish_reason: str
             if not info.is_truncated:
                 info.is_truncated = True
                 info.reason = f"tool_parse_error in {tu.get('name', 'unknown')}"
-                logger.info(f"[{request_id}] 截断检测: 工具 {tu.get('name')} 解析不完整，将触发续传")
+                logger.warning(f"[{request_id}] 截断检测: 工具解析失败 - {tu.get('name')}")
         else:
             info.valid_tool_uses.append(tu)
-
-    # 检测6: 启发式检测 - 文本末尾是否在语句中间被截断
-    # 注意：这个检测优先级最低，只在其他检测都没触发时才检查
-    # 并且只在 stream_completed=True 且 finish_reason 正常时才检查
-    # 避免误报导致不必要的续传
-    if not info.is_truncated and len(full_text) > 100 and stream_completed and finish_reason in ("end_turn", "stop"):
-        last_100_chars = full_text[-100:].strip()
-
-        # 只检查明确的截断模式（更保守）
-        # 这些模式只在代码块内且明显未完成时才触发
-        incomplete_patterns = [
-            # SQL 语句明显未完成（关键字后没有内容）
-            r'\bINSERT\s+INTO\s+\w+\s*\($',  # INSERT INTO table(
-            r'\bVALUES\s*\(\s*$',  # VALUES (
-            r'\bSET\s+\w+\s*=\s*$',  # SET column =
-            # 代码定义明显未完成
-            r'function\s+\w+\s*\([^)]*$',  # function name( 参数未闭合
-            r'=>\s*\{?\s*$',  # 箭头函数后没有内容
-        ]
-
-        import re
-        for pattern in incomplete_patterns:
-            if re.search(pattern, last_100_chars, re.IGNORECASE):
-                info.is_truncated = True
-                info.reason = f"incomplete_statement (pattern: {pattern[:30]}...)"
-                logger.debug(f"[{request_id}] 截断检测: 语句未完成 - {info.reason}")
-                break
 
     return info
 
@@ -2015,91 +1851,44 @@ def build_continuation_request(
 
 
 def merge_responses(original_text: str, continuation_text: str, request_id: str) -> str:
-    """合并原始响应和续传响应 - 优化版
+    """合并原始响应和续传响应
 
     策略：
-    1. 多层重叠检测（精确匹配 + 模糊匹配）
-    2. JSON 边界感知拼接
-    3. 代码块边界处理
-    4. 工具调用边界处理
+    1. 检测续传响应是否有重复内容
+    2. 智能拼接，避免重复
+    3. 处理 JSON 边界情况
     """
     if not continuation_text:
         return original_text
 
-    config = CONTINUATION_CONFIG.get("smart_merge", {})
-    max_overlap = config.get("max_overlap_check", 200)
+    # 清理续传响应开头可能的重复内容
+    continuation_clean = continuation_text.strip()
 
-    continuation_clean = continuation_text
+    # 检查是否有明显的重复（续传响应以原始结尾开始）
+    overlap_check_len = min(100, len(original_text))
+    original_ending = original_text[-overlap_check_len:]
 
-    # ========== 第一层：精确重叠检测 ==========
-    overlap_found = 0
-    overlap_check_len = min(max_overlap, len(original_text), len(continuation_clean))
+    # 查找重叠
+    for i in range(len(original_ending), 0, -1):
+        if continuation_clean.startswith(original_ending[-i:]):
+            # 找到重叠，去除重复部分
+            continuation_clean = continuation_clean[i:]
+            logger.info(f"[{request_id}] 合并响应: 检测到 {i} 字符重叠，已去除")
+            break
 
-    if overlap_check_len > 10:
-        original_ending = original_text[-overlap_check_len:]
-
-        # 从长到短查找重叠
-        for i in range(overlap_check_len, 5, -1):
-            suffix = original_ending[-i:]
-            if continuation_clean.startswith(suffix):
-                overlap_found = i
-                continuation_clean = continuation_clean[i:]
-                break
-
-    # ========== 第二层：模糊重叠检测（处理轻微差异）==========
-    if overlap_found == 0 and len(original_text) > 50 and len(continuation_clean) > 50:
-        # 检查续传是否以原文的某个片段开始（可能有轻微格式差异）
-        original_last_50 = original_text[-50:].strip()
-        cont_first_100 = continuation_clean[:100]
-
-        # 查找原文结尾在续传开头的位置
-        for check_len in [40, 30, 20, 15]:
-            if check_len > len(original_last_50):
-                continue
-            snippet = original_last_50[-check_len:]
-            pos = cont_first_100.find(snippet)
-            if pos != -1 and pos < 60:  # 在前60字符内找到
-                # 找到重叠，从重叠结束位置开始
-                overlap_found = pos + check_len
-                continuation_clean = continuation_clean[overlap_found:]
-                break
-
-    if overlap_found > 0:
-        logger.debug(f"[{request_id}] 合并响应: 检测到 {overlap_found} 字符重叠")
-
-    # ========== 第三层：智能边界拼接 ==========
-    original_stripped = original_text.rstrip()
-    cont_stripped = continuation_clean.lstrip()
-
-    # 检测原文结尾类型
-    last_char = original_stripped[-1:] if original_stripped else ''
-
-    # JSON 中间截断 - 直接拼接
-    if last_char in (',', ':', '"', '{', '[', '\\'):
+    # 智能拼接
+    # 检查原始文本是否在 JSON 中间被截断
+    if original_text.rstrip().endswith((',', ':', '"', '{', '[')):
+        # JSON 中间截断，直接拼接
         merged = original_text + continuation_clean
-    # JSON 结构边界
-    elif last_char in ('}', ']') and cont_stripped and cont_stripped[0] in (',', '}', ']', '\n'):
+    elif original_text.rstrip()[-1:] in ('}', ']', '"') and continuation_clean.startswith((',', '}', ']')):
+        # JSON 结构边界，直接拼接
         merged = original_text + continuation_clean
-    # 代码块中间截断
-    elif '```' in original_text[-200:] and original_text.count('```') % 2 == 1:
-        # 在未闭合的代码块中，直接拼接
-        merged = original_text + continuation_clean
-    # 工具调用中间截断
-    elif original_text.rstrip().endswith('Input:') or 'Input: {' in original_text[-100:]:
-        merged = original_text + continuation_clean
-    # 普通文本 - 检查是否需要换行
-    elif last_char in ('.', '!', '?', '\n'):
-        # 句子结束，可能需要换行
-        if not continuation_clean.startswith('\n') and not original_text.endswith('\n'):
-            merged = original_text + '\n' + continuation_clean
-        else:
-            merged = original_text + continuation_clean
     else:
-        # 默认直接拼接
+        # 其他情况，可能需要空格分隔
         merged = original_text + continuation_clean
 
-    logger.info(f"[{request_id}] 合并响应: 原始={len(original_text)}, 续传={len(continuation_text)}, "
-                f"重叠={overlap_found}, 合并后={len(merged)}")
+    logger.info(f"[{request_id}] 合并响应: 原始={len(original_text)}, 续传={len(continuation_text)}, 合并后={len(merged)}")
 
     return merged
 
@@ -2157,19 +1946,14 @@ async def fetch_with_continuation(
         # 检查是否应该续传
         should_continue = False
         triggers = config.get("triggers", {})
-        reason = truncation_info.reason
 
-        if reason == "stream_interrupted" and triggers.get("stream_interrupted", True):
+        if truncation_info.reason == "stream_interrupted" and triggers.get("stream_interrupted", True):
             should_continue = True
-        elif reason == "max_tokens_reached" and triggers.get("max_tokens_reached", True):
+        elif truncation_info.reason == "max_tokens_reached" and triggers.get("max_tokens_reached", True):
             should_continue = True
-        elif "incomplete_json" in str(reason) and triggers.get("incomplete_tool_json", True):
+        elif "incomplete_json" in str(truncation_info.reason) and triggers.get("incomplete_tool_json", True):
             should_continue = True
-        elif "tool_parse_error" in str(reason) and triggers.get("parse_error", True):
-            should_continue = True
-        elif "incomplete_code_block" in str(reason) and triggers.get("incomplete_code_block", True):
-            should_continue = True
-        elif "incomplete_statement" in str(reason) and triggers.get("incomplete_statement", True):
+        elif "tool_parse_error" in str(truncation_info.reason) and triggers.get("parse_error", True):
             should_continue = True
 
         if not should_continue:
@@ -2463,7 +2247,7 @@ def convert_anthropic_to_openai_simple(anthropic_body: dict) -> dict:
 
     # 构建 OpenAI 请求
     openai_body = {
-        "model": anthropic_body.get("model", "claude-sonnet-4-5-20250929"),
+        "model": anthropic_body.get("model", "claude-sonnet-4"),
         "messages": messages,
         "stream": anthropic_body.get("stream", False),
     }
@@ -2490,7 +2274,7 @@ async def anthropic_messages(request: Request):
     except json.JSONDecodeError:
         raise HTTPException(400, "Invalid JSON")
 
-    original_model = body.get("model", "claude-sonnet-4-5-20250929")
+    original_model = body.get("model", "claude-sonnet-4")
     stream = body.get("stream", False)
     orig_msg_count = len(body.get("messages", []))
 
@@ -2512,8 +2296,7 @@ async def anthropic_messages(request: Request):
 
     # ==================== 智能模型路由 ====================
     # 对 Opus 请求进行智能降级判断
-    request_headers = dict(request.headers)
-    routed_model, route_reason = model_router.route(body, request_headers)
+    routed_model, route_reason = model_router.route(body)
 
     if routed_model != original_model:
         logger.info(f"[{request_id}] 🔀 模型路由: {original_model} -> {routed_model} ({route_reason})")
@@ -2836,7 +2619,7 @@ async def chat_completions(request: Request):
     except json.JSONDecodeError:
         raise HTTPException(400, "Invalid JSON")
 
-    model = body.get("model", "claude-sonnet-4-5-20250929")
+    model = body.get("model", "claude-sonnet-4")
     messages = body.get("messages", [])
     stream = body.get("stream", False)
 
