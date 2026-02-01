@@ -18,10 +18,8 @@ import uuid
 import asyncio
 import logging
 import os
-import re
 from typing import Optional, AsyncIterator
 from contextlib import asynccontextmanager
-from functools import lru_cache
 
 import httpx
 from fastapi import FastAPI, Request, HTTPException
@@ -48,9 +46,8 @@ CONTINUATION_CONFIG = {
     "enabled": os.getenv("CONTINUATION_ENABLED", "true").lower() in ("1", "true", "yes"),
 
     # 最大续传次数（防止无限循环）
-    # 优化：从 15 降低到 5，配合空响应验证可以更快失败
-    # 如果需要处理超长输出，可以通过环境变量调整
-    "max_continuations": int(os.getenv("MAX_CONTINUATIONS", "5")),
+    # 默认增加到 10 次，以应对超长输出（如 6000+ 行代码文件）
+    "max_continuations": int(os.getenv("MAX_CONTINUATIONS", "10")),
 
     # 触发续传的条件
     "triggers": {
@@ -86,25 +83,33 @@ Continue from here:""",
     # 续传请求的 max_tokens（确保有足够空间完成）
     "continuation_max_tokens": int(os.getenv("CONTINUATION_MAX_TOKENS", "8192")),
 
+    # 服务器端强制输出上限（防止超过 Claude Code CLI 的 32000 默认限制）
+    # 设置为 28000 以确保充足的安全余量，同时提供尽可能多的内容
+    "max_total_output_tokens": int(os.getenv("MAX_TOTAL_OUTPUT_TOKENS", "28000")),
+
+    # 强制字符上限（作为第二层保护，约 11 万字符对应 28k tokens）
+    "max_total_chars": int(os.getenv("MAX_TOTAL_CHARS", "112000")),
+
     # 日志级别
     "log_continuations": True,
 }
 
 # 历史消息管理配置
-# 优化配置：平衡上下文保留和稳定性
+# 调整阈值，更早触发截断以避免 "Input is too long" 错误
 HISTORY_CONFIG = HistoryConfig(
     strategies=[
-        TruncateStrategy.AUTO_TRUNCATE,     # 自动截断 - 发送前优先保留最新上下文
-        TruncateStrategy.SMART_SUMMARY,     # 智能摘要 - 用 AI 生成早期对话摘要
-        TruncateStrategy.ERROR_RETRY,       # 错误重试 - 遇到长度错误时截断后重试（推荐）
+        TruncateStrategy.PRE_ESTIMATE,      # 优先预估，提前截断
+        TruncateStrategy.AUTO_TRUNCATE,     # 自动截断
+        TruncateStrategy.SMART_SUMMARY,     # 智能摘要
+        TruncateStrategy.ERROR_RETRY,       # 错误重试
     ],
-    max_messages=30,           # 最大消息数
-    max_chars=150000,          # 最大字符数
-    summary_keep_recent=10,    # 保留最近 10 条消息完整
-    summary_threshold=100000,  # 触发摘要阈值（字符）
-    retry_max_messages=20,     # 重试时保留消息数
-    max_retries=2,             # 最大重试次数
-    estimate_threshold=150000, # 预估截断阈值
+    max_messages=25,           # 30 → 25，减少最大消息数
+    max_chars=100000,          # 150000 → 100000，降低字符上限
+    summary_keep_recent=8,     # 10 → 8，保留更少的最近消息
+    summary_threshold=80000,   # 100000 → 80000，更早触发摘要
+    retry_max_messages=15,     # 20 → 15，重试时保留更少消息
+    max_retries=3,             # 2 → 3，增加重试次数
+    estimate_threshold=100000, # 180000 → 100000，更早预估截断
     summary_cache_enabled=True,
     add_warning_header=True,
 )
@@ -123,15 +128,15 @@ STREAM_TOOL_JSON_CHUNK_SIZE = int(os.getenv("STREAM_TOOL_JSON_CHUNK_SIZE", "2000
 STREAM_THINKING_CHUNK_SIZE = int(os.getenv("STREAM_THINKING_CHUNK_SIZE", str(STREAM_TEXT_CHUNK_SIZE)))
 
 # Anthropic -> OpenAI 转换保真度配置（默认最大保真）
-ANTHROPIC_TRUNCATE_ENABLED = os.getenv("ANTHROPIC_TRUNCATE_ENABLED", "false").lower() in ("1", "true", "yes")
-ANTHROPIC_MAX_MESSAGES = int(os.getenv("ANTHROPIC_MAX_MESSAGES", "200"))
-ANTHROPIC_MAX_TOTAL_CHARS = int(os.getenv("ANTHROPIC_MAX_TOTAL_CHARS", "1000000"))
+ANTHROPIC_TRUNCATE_ENABLED = os.getenv("ANTHROPIC_TRUNCATE_ENABLED", "true").lower() in ("1", "true", "yes")
+ANTHROPIC_MAX_MESSAGES = int(os.getenv("ANTHROPIC_MAX_MESSAGES", "500"))
+ANTHROPIC_MAX_TOTAL_CHARS = int(os.getenv("ANTHROPIC_MAX_TOTAL_CHARS", "600000"))
 ANTHROPIC_MAX_SINGLE_CONTENT = int(os.getenv("ANTHROPIC_MAX_SINGLE_CONTENT", "300000"))
-ANTHROPIC_TOOL_INPUT_MAX_CHARS = int(os.getenv("ANTHROPIC_TOOL_INPUT_MAX_CHARS", "200000"))
-ANTHROPIC_TOOL_RESULT_MAX_CHARS = int(os.getenv("ANTHROPIC_TOOL_RESULT_MAX_CHARS", "300000"))
+ANTHROPIC_TOOL_INPUT_MAX_CHARS = int(os.getenv("ANTHROPIC_TOOL_INPUT_MAX_CHARS", "150000"))
+ANTHROPIC_TOOL_RESULT_MAX_CHARS = int(os.getenv("ANTHROPIC_TOOL_RESULT_MAX_CHARS", "200000"))
 ANTHROPIC_CLEAN_SYSTEM_ENABLED = os.getenv("ANTHROPIC_CLEAN_SYSTEM_ENABLED", "false").lower() in ("1", "true", "yes")
 ANTHROPIC_CLEAN_ASSISTANT_ENABLED = os.getenv("ANTHROPIC_CLEAN_ASSISTANT_ENABLED", "false").lower() in ("1", "true", "yes")
-ANTHROPIC_MERGE_SAME_ROLE_ENABLED = os.getenv("ANTHROPIC_MERGE_SAME_ROLE_ENABLED", "false").lower() in ("1", "true", "yes")
+ANTHROPIC_MERGE_SAME_ROLE_ENABLED = os.getenv("ANTHROPIC_MERGE_SAME_ROLE_ENABLED", "true").lower() in ("1", "true", "yes")
 ANTHROPIC_ENSURE_USER_ENDING = os.getenv("ANTHROPIC_ENSURE_USER_ENDING", "true").lower() in ("1", "true", "yes")
 ANTHROPIC_EMPTY_ASSISTANT_PLACEHOLDER = os.getenv("ANTHROPIC_EMPTY_ASSISTANT_PLACEHOLDER", " ")
 TOOL_DESC_MAX_CHARS = int(os.getenv("TOOL_DESC_MAX_CHARS", "8000"))
@@ -235,41 +240,6 @@ MODEL_ROUTING_CONFIG = {
     "log_routing_decision": True,         # 记录路由决策原因
 }
 
-# ==================== 预编译正则表达式 ====================
-# 性能优化：避免在热路径中重复编译正则表达式
-
-# 用于清理 assistant 内容
-_RE_THINKING_TAG = re.compile(r'<thinking>(.*?)</thinking>', re.IGNORECASE | re.DOTALL)
-_RE_THINKING_UNCLOSED = re.compile(r'<thinking>.*$', re.DOTALL)
-_RE_THINKING_UNOPEN = re.compile(r'^.*</thinking>', re.DOTALL)
-_RE_REDACTED_THINKING = re.compile(r'<redacted_thinking>.*?</redacted_thinking>', re.DOTALL)
-_RE_SIGNATURE_TAG = re.compile(r'<signature>.*?</signature>', re.DOTALL)
-
-# 用于解析工具调用
-_RE_TOOL_CALL = re.compile(r'\[Calling tool:\s*([^\]]+)\]')
-_RE_INPUT_PREFIX = re.compile(r'^[\s]*Input:\s*')
-_RE_MARKDOWN_START = re.compile(r'```(?:json)?\s*')
-_RE_MARKDOWN_END = re.compile(r'\s*```')
-
-# 用于 JSON 修复
-_RE_TRAILING_COMMA_OBJ = re.compile(r',\s*}')
-_RE_TRAILING_COMMA_ARR = re.compile(r',\s*]')
-
-# 用于合并响应时的清理
-_RE_CONTINUATION_INTRO = [
-    re.compile(r"^Continuing from.*?:", re.IGNORECASE | re.DOTALL),
-    re.compile(r"^Here is the rest of the response:", re.IGNORECASE),
-    re.compile(r"^Continuing the JSON:", re.IGNORECASE),
-    re.compile(r"^```json\s*"),
-    re.compile(r"^```\s*"),
-]
-
-# 用于检测下一个标记
-_RE_NEXT_MARKER = re.compile(r'\[Calling tool:|\[Tool Result\]|\[Tool Error\]')
-
-# 用于文件路径匹配
-_RE_FILE_PATH = re.compile(r'[/\\][\w\-\.]+\.(py|js|ts|jsx|tsx|go|rs|java|cpp|c|h|md|yaml|yml|json|toml)')
-
 
 class ModelRouter:
     """智能模型路由器 - 根据请求复杂度决定使用 Opus 还是 Sonnet"""
@@ -278,9 +248,6 @@ class ModelRouter:
         self.config = config or MODEL_ROUTING_CONFIG
         self.stats = {"opus": 0, "sonnet": 0, "other": 0}
         self._lock = asyncio.Lock()
-        # 预处理关键词为小写，避免每次匹配时重复转换
-        self._opus_keywords_lower = [kw.lower() for kw in self.config.get("force_opus_keywords", [])]
-        self._sonnet_keywords_lower = [kw.lower() for kw in self.config.get("force_sonnet_keywords", [])]
 
     def _count_chars(self, messages: list, system: str = "") -> int:
         """统计总字符数"""
@@ -312,19 +279,21 @@ class ModelRouter:
 
     def _count_files_mentioned(self, messages: list) -> int:
         """统计提及的文件数量（简单估算）"""
+        import re
         files = set()
+        file_pattern = r'[/\\][\w\-\.]+\.(py|js|ts|jsx|tsx|go|rs|java|cpp|c|h|md|yaml|yml|json|toml)'
 
         for msg in messages:
             content = msg.get("content", "")
             if isinstance(content, str):
-                matches = _RE_FILE_PATH.findall(content)
+                matches = re.findall(file_pattern, content)
                 files.update(matches)
             elif isinstance(content, list):
                 for item in content:
                     if isinstance(item, dict):
                         text = item.get("text", "") or item.get("content", "")
                         if isinstance(text, str):
-                            matches = _RE_FILE_PATH.findall(text)
+                            matches = re.findall(file_pattern, text)
                             files.update(matches)
         return len(files)
 
@@ -344,24 +313,12 @@ class ModelRouter:
         return ""
 
     def _contains_keywords(self, text: str, keywords: list) -> bool:
-        """检查文本是否包含关键词（兼容旧接口）"""
+        """检查文本是否包含关键词"""
         text_lower = text.lower()
         for kw in keywords:
             if kw.lower() in text_lower:
                 return True
         return False
-
-    def _contains_keywords_optimized(self, text: str, keywords_lower: list) -> tuple[bool, str]:
-        """优化版关键词检查，使用预处理的小写关键词列表
-
-        Returns:
-            (found, matched_keyword)
-        """
-        text_lower = text.lower()
-        for kw in keywords_lower:
-            if kw in text_lower:
-                return True, kw
-        return False, ""
 
     def _count_user_messages(self, messages: list) -> int:
         """统计用户消息数量"""
@@ -453,18 +410,21 @@ class ModelRouter:
                     return True, f"主Agent首轮({main_agent_prob}%)"
 
         # ============================================================
-        # 第一优先级：强制 Opus 关键词（使用预处理的小写关键词）
+        # 第一优先级：强制 Opus 关键词
         # ============================================================
-        found, matched_kw = self._contains_keywords_optimized(last_user_msg, self._opus_keywords_lower)
-        if found:
-            return True, f"关键词[{matched_kw}]"
+        force_opus_keywords = self.config.get("force_opus_keywords", [])
+        if self._contains_keywords(last_user_msg, force_opus_keywords):
+            # 找出匹配的关键词
+            matched = [kw for kw in force_opus_keywords if kw.lower() in last_user_msg.lower()]
+            return True, f"关键词[{matched[0] if matched else '?'}]"
 
         # ============================================================
-        # 第二优先级：强制 Sonnet 关键词（使用预处理的小写关键词）
+        # 第二优先级：强制 Sonnet 关键词
         # ============================================================
-        found, matched_kw = self._contains_keywords_optimized(last_user_msg, self._sonnet_keywords_lower)
-        if found:
-            return False, f"简单任务[{matched_kw}]"
+        force_sonnet_keywords = self.config.get("force_sonnet_keywords", [])
+        if self._contains_keywords(last_user_msg, force_sonnet_keywords):
+            matched = [kw for kw in force_sonnet_keywords if kw.lower() in last_user_msg.lower()]
+            return False, f"简单任务[{matched[0] if matched else '?'}]"
 
         # ============================================================
         # 第三优先级：对话阶段判断
@@ -499,38 +459,9 @@ class ModelRouter:
         else:
             return False, f"默认Sonnet(msg={user_msg_count},tools={tool_calls})"
 
-    async def route(self, request_body: dict) -> tuple[str, str]:
+    def route(self, request_body: dict) -> tuple[str, str]:
         """
-        路由到合适的模型（线程安全版本）
-
-        Returns:
-            (routed_model, reason)
-        """
-        original_model = request_body.get("model", "")
-
-        # 只处理 Opus 请求
-        if "opus" not in original_model.lower():
-            async with self._lock:
-                self.stats["other"] += 1
-            return original_model, "非Opus请求"
-
-        should_opus, reason = self.should_use_opus(request_body)
-
-        async with self._lock:
-            if should_opus:
-                self.stats["opus"] += 1
-            else:
-                self.stats["sonnet"] += 1
-
-        if should_opus:
-            return self.config.get("opus_model", "claude-opus-4-5-20251101"), reason
-        else:
-            return self.config.get("sonnet_model", "claude-sonnet-4-5-20250929"), reason
-
-    def route_sync(self, request_body: dict) -> tuple[str, str]:
-        """
-        路由到合适的模型（同步版本，用于非异步上下文）
-        注意：统计数据在高并发下可能不精确
+        路由到合适的模型
 
         Returns:
             (routed_model, reason)
@@ -706,15 +637,11 @@ def extract_user_content(messages: list[dict]) -> str:
     return ""
 
 
-# 摘要生成模型配置
-SUMMARY_MODEL = os.getenv("SUMMARY_MODEL", "claude-haiku-4-5-20251001")
-
-
 async def call_kiro_for_summary(prompt: str) -> str:
     """调用 Kiro API 生成摘要 - 使用全局 HTTP 客户端"""
     summary_id = uuid.uuid4().hex[:8]
     request_body = {
-        "model": SUMMARY_MODEL,  # 使用 Haiku 4.5 快速模型
+        "model": "claude-haiku-4",  # 使用快速模型
         "messages": [{"role": "user", "content": prompt}],
         "stream": False,
         "max_tokens": 2000,
@@ -748,61 +675,26 @@ async def call_kiro_for_summary(prompt: str) -> str:
 
 # ==================== Token 计数 ====================
 
-# Token 估算缓存 - 避免对相同文本重复计算
-# 使用文本哈希作为缓存键，避免存储大量文本
-@lru_cache(maxsize=2048)
-def _estimate_tokens_cached(text_hash: int, text_len: int, chinese_ratio_pct: int) -> int:
-    """基于文本特征的 token 估算（带缓存）
-
-    Args:
-        text_hash: 文本的哈希值
-        text_len: 文本长度
-        chinese_ratio_pct: 中文字符占比（0-100）
-
-    Returns:
-        估算的 token 数量
-    """
-    chinese_chars = int(text_len * chinese_ratio_pct / 100)
-    other_chars = text_len - chinese_chars
-
-    # 中文约 1.5 字符/token，其他约 4 字符/token
-    chinese_tokens = chinese_chars / 1.5
-    other_tokens = other_chars / 4
-
-    return int(chinese_tokens + other_tokens)
-
-
 def estimate_tokens(text: str) -> int:
-    """估算文本的 token 数量（优化版，带缓存）
+    """估算文本的 token 数量
 
     简单估算规则：
     - 英文/代码：约 4 个字符 = 1 token
     - 中文：约 1.5 个字符 = 1 token
     - 混合计算取平均
-
-    优化：
-    - 使用 LRU 缓存避免重复计算
-    - 对于短文本直接计算，避免缓存开销
     """
     if not text:
         return 0
 
-    text_len = len(text)
-
-    # 短文本直接计算，避免缓存开销
-    if text_len < 100:
-        chinese_chars = sum(1 for c in text if '\u4e00' <= c <= '\u9fff')
-        other_chars = text_len - chinese_chars
-        return int(chinese_chars / 1.5 + other_chars / 4)
-
-    # 统计中文字符数并计算占比
+    # 统计中文字符数
     chinese_chars = sum(1 for c in text if '\u4e00' <= c <= '\u9fff')
-    chinese_ratio_pct = int(chinese_chars * 100 / text_len) if text_len > 0 else 0
+    other_chars = len(text) - chinese_chars
 
-    # 使用文本哈希作为缓存键
-    text_hash = hash(text)
+    # 中文约 1.5 字符/token，代码/英文采用更保守的 2.5 字符/token（防止低估导致溢出）
+    chinese_tokens = chinese_chars / 1.5
+    other_tokens = other_chars / 2.5
 
-    return _estimate_tokens_cached(text_hash, text_len, chinese_ratio_pct)
+    return int(chinese_tokens + other_tokens)
 
 
 def estimate_messages_tokens(messages: list, system: str = "") -> int:
@@ -1116,17 +1008,17 @@ def clean_system_content(content: str) -> str:
 
 
 def clean_assistant_content(content: str) -> str:
-    """清理 assistant 消息内容（优化版）
+    """清理 assistant 消息内容
 
     移除格式化标记：
     - (no content)
     - [Calling tool: xxx]
     - <thinking>...</thinking> 标签（Kiro API 不支持）
-
-    优化：使用预编译的正则表达式
     """
     if not content:
         return content
+
+    import re
 
     # 移除 (no content) 标记
     content = content.replace("(no content)", "").strip()
@@ -1134,18 +1026,18 @@ def clean_assistant_content(content: str) -> str:
     # 不再移除 [Calling tool: xxx] 标记，因为我们使用这个格式来内联工具调用
 
     # 移除 <thinking>...</thinking> 标签（Kiro API 不支持）
-    # 保留标签内的内容，但移除标签本身（使用预编译正则）
-    content = _RE_THINKING_TAG.sub(r'\1', content)
+    # 保留标签内的内容，但移除标签本身
+    content = re.sub(r'<thinking>(.*?)</thinking>', r'\1', content, flags=re.DOTALL)
 
-    # 移除未闭合的 <thinking> 标签（使用预编译正则）
-    content = _RE_THINKING_UNCLOSED.sub('', content)
-    content = _RE_THINKING_UNOPEN.sub('', content)
+    # 移除未闭合的 <thinking> 标签
+    content = re.sub(r'<thinking>.*$', '', content, flags=re.DOTALL)
+    content = re.sub(r'^.*</thinking>', '', content, flags=re.DOTALL)
 
-    # 移除 <redacted_thinking> 相关标签（使用预编译正则）
-    content = _RE_REDACTED_THINKING.sub('', content)
+    # 移除 <redacted_thinking> 相关标签
+    content = re.sub(r'<redacted_thinking>.*?</redacted_thinking>', '', content, flags=re.DOTALL)
 
-    # 移除其他可能的 Claude 特有标签（使用预编译正则）
-    content = _RE_SIGNATURE_TAG.sub('', content)
+    # 移除其他可能的 Claude 特有标签
+    content = re.sub(r'<signature>.*?</signature>', '', content, flags=re.DOTALL)
 
     return content.strip() if content.strip() else " "
 
@@ -1222,7 +1114,8 @@ def convert_anthropic_to_openai(anthropic_body: dict) -> dict:
                         tool_name = item.get("name", "unknown")
                         tool_input = item.get("input", {})
                         input_str = json.dumps(tool_input, ensure_ascii=False)
-                        if ANTHROPIC_TRUNCATE_ENABLED and len(input_str) > ANTHROPIC_TOOL_INPUT_MAX_CHARS:
+                        # 智能截断过大的工具输入
+                        if len(input_str) > ANTHROPIC_TOOL_INPUT_MAX_CHARS:
                             input_str = input_str[:ANTHROPIC_TOOL_INPUT_MAX_CHARS] + "...[truncated]"
                         text_parts.append(f"[Calling tool: {tool_name}]\nInput: {input_str}")
                     elif item_type == "tool_result":
@@ -1238,7 +1131,6 @@ def convert_anthropic_to_openai(anthropic_body: dict) -> dict:
                                     else:
                                         extracted = extract_content_item(c)
                                         if extracted:
-                                            # Strip potential double prefix from extract_content_item
                                             if extracted.startswith(("[Tool Result]\n", "[Tool Error]\n")):
                                                 extracted = extracted.split("\n", 1)[1]
                                             parts.append(extracted)
@@ -1253,12 +1145,24 @@ def convert_anthropic_to_openai(anthropic_body: dict) -> dict:
                         if not tool_content:
                             tool_content = "Error" if is_error else "OK"
 
+                        # 核心优化：对 Tool Result 进行更激进的截断（它们通常是历史臃肿的根源）
+                        # 如果是大型文件读取或构建日志，只保留头部和尾部
+                        if len(tool_content) > ANTHROPIC_TOOL_RESULT_MAX_CHARS:
+                            keep = ANTHROPIC_TOOL_RESULT_MAX_CHARS // 2
+                            tool_content = (
+                                tool_content[:keep] + 
+                                f"\n\n... [TRUNCATED {len(tool_content) - ANTHROPIC_TOOL_RESULT_MAX_CHARS} CHARS] ...\n\n" + 
+                                tool_content[-keep:]
+                            )
+                        
                         prefix = "[Tool Error]" if is_error else "[Tool Result]"
-                        if ANTHROPIC_TRUNCATE_ENABLED and len(tool_content) > ANTHROPIC_TOOL_RESULT_MAX_CHARS:
-                            tool_content = tool_content[:ANTHROPIC_TOOL_RESULT_MAX_CHARS] + "\n...[truncated]"
                         text_parts.append(f"{prefix}\n{tool_content}")
                     elif item_type == "thinking":
-                        pass  # 忽略 thinking blocks
+                        thinking_content = item.get("thinking", "")
+                        if thinking_content:
+                            # 将 thinking block 转换为文本块，保留模型推理过程
+                            # 使用特定标记包裹，以便模型识别这是它之前的思考
+                            text_parts.append(f"<thinking>\n{thinking_content}\n</thinking>")
                     else:
                         extracted = extract_content_item(item)
                         if extracted:
@@ -1499,7 +1403,7 @@ def escape_json_string_newlines(json_str: str) -> str:
 
 
 def _try_parse_json(json_str: str, end_pos: int) -> tuple[dict, int]:
-    """尝试多种方式解析 JSON 字符串（优化版）
+    """尝试多种方式解析 JSON 字符串
 
     Args:
         json_str: JSON 字符串
@@ -1507,31 +1411,19 @@ def _try_parse_json(json_str: str, end_pos: int) -> tuple[dict, int]:
 
     Returns:
         (parsed_json, end_position) 或抛出异常
-
-    优化：
-    - 快速路径：直接解析成功则立即返回
-    - 使用预编译的正则表达式
-    - 减少不必要的字符串操作
     """
-    # 快速路径：直接解析
+    import re
+
+    # 直接解析
     try:
         return json.loads(json_str), end_pos
     except json.JSONDecodeError:
         pass
 
-    # 进入修复路径
-    return _try_repair_json(json_str, end_pos)
-
-
-def _try_repair_json(json_str: str, end_pos: int) -> tuple[dict, int]:
-    """尝试修复并解析 JSON 字符串
-
-    仅在直接解析失败时调用，避免不必要的修复尝试
-    """
-    # 修复策略 1: 移除尾随逗号（使用预编译正则）
+    # 修复策略 1: 移除尾随逗号
     try:
-        fixed = _RE_TRAILING_COMMA_OBJ.sub('}', json_str)
-        fixed = _RE_TRAILING_COMMA_ARR.sub(']', fixed)
+        fixed = re.sub(r',\s*}', '}', json_str)
+        fixed = re.sub(r',\s*]', ']', fixed)
         return json.loads(fixed), end_pos
     except json.JSONDecodeError:
         pass
@@ -1546,19 +1438,23 @@ def _try_repair_json(json_str: str, end_pos: int) -> tuple[dict, int]:
     # 修复策略 3: 组合修复
     try:
         fixed = escape_json_string_newlines(json_str)
-        fixed = _RE_TRAILING_COMMA_OBJ.sub('}', fixed)
-        fixed = _RE_TRAILING_COMMA_ARR.sub(']', fixed)
+        fixed = re.sub(r',\s*}', '}', fixed)
+        fixed = re.sub(r',\s*]', ']', fixed)
         return json.loads(fixed), end_pos
     except json.JSONDecodeError:
         pass
 
     # 修复策略 4: 处理截断的字符串值
+    # 如果 JSON 在字符串中间被截断，尝试闭合
     try:
+        # 检查未闭合的引号
         quote_count = json_str.count('"') - json_str.count('\\"')
         if quote_count % 2 == 1:
+            # 奇数个引号，尝试闭合
             fixed = json_str.rstrip()
             if not fixed.endswith('"'):
                 fixed = fixed + '"'
+            # 检查是否需要闭合对象
             open_braces = fixed.count('{') - fixed.count('}')
             if open_braces > 0:
                 fixed = fixed + '}' * open_braces
@@ -1567,7 +1463,9 @@ def _try_repair_json(json_str: str, end_pos: int) -> tuple[dict, int]:
         pass
 
     # 修复策略 5: 提取有效的 JSON 子集
+    # 尝试找到最长的有效 JSON 前缀
     try:
+        # 使用 json.JSONDecoder 来找到有效部分
         decoder = json.JSONDecoder()
         obj, idx = decoder.raw_decode(json_str)
         return obj, end_pos
@@ -1586,16 +1484,16 @@ def extract_json_from_position(text: str, start: int) -> tuple[dict, int]:
 
     Returns:
         (parsed_json, end_position) 或抛出异常
-
-    优化：使用预编译的正则表达式
     """
+    import re
+
     # 跳过空白找到 '{' 或 Markdown 代码块标记
     pos = start
     while pos < len(text) and text[pos] in ' \t\n\r':
         pos += 1
 
-    # 检查是否以 ```json 或 ``` 开头（使用预编译正则）
-    markdown_match = _RE_MARKDOWN_START.match(text[pos:])
+    # 检查是否以 ```json 或 ``` 开头
+    markdown_match = re.match(r'```(?:json)?\s*', text[pos:])
     is_markdown_wrapped = False
     if markdown_match:
         is_markdown_wrapped = True
@@ -1612,7 +1510,7 @@ def extract_json_from_position(text: str, start: int) -> tuple[dict, int]:
     in_string = False
     escape = False
     json_start = pos
-
+    
     while pos < len(text):
         c = text[pos]
 
@@ -1642,15 +1540,15 @@ def extract_json_from_position(text: str, start: int) -> tuple[dict, int]:
             if depth == 0:
                 json_str = text[json_start:pos + 1]
                 parsed_json, _ = _try_parse_json(json_str, pos + 1)
-
-                # 如果是 markdown 包装的，还需要跳过结尾标记（使用预编译正则）
+                
+                # 如果是 markdown 包装的，还需要跳过结尾标记
                 end_pos = pos + 1
                 if is_markdown_wrapped:
                     remaining = text[end_pos:]
-                    end_match = _RE_MARKDOWN_END.search(remaining)
+                    end_match = re.search(r'\s*```', remaining)
                     if end_match:
                         end_pos += end_match.end()
-
+                
                 return parsed_json, end_pos
 
         pos += 1
@@ -1780,17 +1678,17 @@ def tool_calls_to_blocks(tool_calls: list) -> list[dict]:
 
 
 def parse_inline_tool_blocks(text: str) -> list[dict]:
-    """解析内联工具调用，保留文本与工具调用顺序（优化版）
+    """解析内联工具调用，保留文本与工具调用顺序"""
+    import re
 
-    优化：使用预编译的正则表达式
-    """
     blocks = []
+    # 匹配 [Calling tool: name]
+    tool_pattern = r'\[Calling tool:\s*([^\]]+)\]'
     last_end = 0
     pos = 0
 
     while pos < len(text):
-        # 使用预编译正则匹配 [Calling tool: name]
-        match = _RE_TOOL_CALL.search(text[pos:])
+        match = re.search(tool_pattern, text[pos:])
         if not match:
             break
 
@@ -1804,9 +1702,10 @@ def parse_inline_tool_blocks(text: str) -> list[dict]:
 
         tool_name = match.group(1).strip()
         after_match = text[match_end:]
-
-        # 查找 Input: 标记（使用预编译正则）
-        input_match = _RE_INPUT_PREFIX.match(after_match)
+        
+        # 查找 Input: 标记
+        input_pattern = r'^[\s]*Input:\s*'
+        input_match = re.match(input_pattern, after_match)
 
         if input_match:
             json_start_pos = match_end + input_match.end()
@@ -1824,15 +1723,15 @@ def parse_inline_tool_blocks(text: str) -> list[dict]:
                 continue
             except Exception as e:
                 logger.warning(f"JSON parse failed for tool {tool_name} at pos {json_start_pos}: {e}")
-
+                
                 # 备选方案：如果 extract_json_from_position 失败，尝试定位下一个标记并提取中间文本
-                # 标记包括：下一个工具调用、工具结果、或者文本结尾（使用预编译正则）
-                next_marker = _RE_NEXT_MARKER.search(after_match[input_match.end():])
+                # 标记包括：下一个工具调用、工具结果、或者文本结尾
+                next_marker = re.search(r'\[Calling tool:|\[Tool Result\]|\[Tool Error\]', after_match[input_match.end():])
                 if next_marker:
                     raw_text = after_match[input_match.end():input_match.end() + next_marker.start()].strip()
                 else:
                     raw_text = after_match[input_match.end():].strip()
-
+                
                 # 尝试再次解析这个片段
                 try:
                     input_json, _ = _try_parse_json(raw_text, 0)
@@ -1964,72 +1863,22 @@ def detect_truncation(full_text: str, stream_completed: bool, finish_reason: str
     return info
 
 
-# 续传请求验证配置
-CONTINUATION_VALIDATION = {
-    # 最小有效文本长度（低于此值不进行续传）
-    "min_text_length": 10,
-    # 最大连续失败次数（超过后停止续传）
-    "max_consecutive_failures": 3,
-    # 空响应时的降级策略
-    "empty_response_action": "skip",  # skip | retry_with_lower_tokens | error
-}
-
-
-def validate_continuation_text(truncated_text: str, request_id: str) -> tuple[bool, str]:
-    """验证截断文本是否有效，决定是否应该续传
-
-    Returns:
-        (is_valid, reason)
-    """
-    config = CONTINUATION_VALIDATION
-    min_length = config.get("min_text_length", 10)
-
-    # 检查是否为空或过短
-    if not truncated_text:
-        return False, "截断文本为空"
-
-    stripped_text = truncated_text.strip()
-    if len(stripped_text) < min_length:
-        return False, f"截断文本过短 ({len(stripped_text)} < {min_length})"
-
-    # 检查是否只包含错误信息
-    error_markers = ["[上游服务错误]", "[Tool Error]", "Error:", "error:"]
-    for marker in error_markers:
-        if stripped_text.startswith(marker):
-            return False, f"截断文本是错误信息: {marker}"
-
-    return True, "有效"
-
-
 def build_continuation_request(
     original_messages: list,
     truncated_text: str,
     original_body: dict,
     continuation_count: int,
     request_id: str
-) -> tuple[dict | None, bool, str]:
-    """构建续传请求（增强版，带验证）
+) -> dict:
+    """构建续传请求
 
     策略：
-    1. 验证截断文本是否有效
-    2. 保留原始消息历史
-    3. 添加截断的 assistant 响应
-    4. 添加续传提示作为新的 user 消息
-
-    Returns:
-        (request_body, should_continue, reason)
-        - request_body: 续传请求体，如果不应续传则为 None
-        - should_continue: 是否应该继续续传
-        - reason: 决策原因
+    1. 确保角色交替 (user -> assistant -> user)
+    2. 处理空内容，防止 400 错误
+    3. 合并相同角色的消息
     """
     config = CONTINUATION_CONFIG
-
-    # ==================== 关键修复：验证截断文本 ====================
-    is_valid, validation_reason = validate_continuation_text(truncated_text, request_id)
-    if not is_valid:
-        logger.warning(f"[{request_id}] 续传验证失败: {validation_reason}，停止续传")
-        return None, False, validation_reason
-
+    
     # 获取截断结尾（用于续传提示）
     ending_chars = config.get("truncated_ending_chars", 500)
     truncated_ending = truncated_text[-ending_chars:] if len(truncated_text) > ending_chars else truncated_text
@@ -2039,54 +1888,81 @@ def build_continuation_request(
         truncated_ending=truncated_ending
     )
 
-    # 构建新的消息列表
-    new_messages = list(original_messages)  # 复制原始消息
+    # 复制原始消息
+    new_messages = []
+    for msg in original_messages:
+        new_messages.append(dict(msg))
 
-    # 添加截断的 assistant 响应
-    new_messages.append({
-        "role": "assistant",
-        "content": truncated_text
-    })
+    # 检查最后一条消息的角色
+    last_role = new_messages[-1].get("role") if new_messages else None
 
-    # 添加续传提示
-    new_messages.append({
-        "role": "user",
-        "content": continuation_prompt
-    })
+    # 如果最后一条是 assistant，且我们有截断内容，则合并或添加
+    if truncated_text and truncated_text.strip():
+        if last_role == "assistant":
+            # 如果原始最后一条就是 assistant，直接追加（虽然通常不会发生）
+            orig_content = new_messages[-1].get("content", "")
+            if isinstance(orig_content, str):
+                new_messages[-1]["content"] = orig_content + truncated_text
+            else:
+                new_messages.append({"role": "assistant", "content": truncated_text})
+        else:
+            new_messages.append({"role": "assistant", "content": truncated_text})
+        
+        # 既然添加了 assistant，现在添加 user 续传提示
+        new_messages.append({"role": "user", "content": continuation_prompt})
+    else:
+        # 如果没有截断内容（例如流刚开始就断了）
+        if last_role == "user":
+            # 如果最后一条是 user，我们不能再加一个 user
+            # 修改最后一条 user 消息，追加续传提示
+            orig_content = new_messages[-1].get("content", "")
+            if isinstance(orig_content, str):
+                new_messages[-1]["content"] = orig_content + "\n\n(Note: Previous attempt interrupted. Please start/continue your response.)"
+            else:
+                # 如果是复杂 content，暂不处理，直接尝试
+                new_messages.append({"role": "assistant", "content": " "})
+                new_messages.append({"role": "user", "content": continuation_prompt})
+        else:
+            # 最后一条不是 user (可能是 system 或 assistant)，可以安全添加 user
+            new_messages.append({"role": "user", "content": continuation_prompt})
 
     # 构建新的请求体
     new_body = dict(original_body)
     new_body["messages"] = new_messages
-
-    # 使用续传专用的 max_tokens
     new_body["max_tokens"] = config.get("continuation_max_tokens", 8192)
 
     logger.info(f"[{request_id}] 构建续传请求 #{continuation_count + 1}: "
                 f"原始消息={len(original_messages)}, 新消息={len(new_messages)}, "
-                f"截断文本长度={len(truncated_text)}, 截断结尾预览={truncated_ending[:100]}...")
+                f"截断文本长度={len(truncated_text)}")
 
-    return new_body, True, "验证通过"
+    return new_body
 
 
 def merge_responses(original_text: str, continuation_text: str, request_id: str) -> str:
-    """合并原始响应和续传响应，增强 JSON 边界处理（优化版）
+    """合并原始响应和续传响应，增强 JSON 边界处理
 
     策略：
     1. 检测续传响应是否有重复内容
     2. 智能拼接，特别处理 JSON 截断点
     3. 修复可能出现的转义冲突
-
-    优化：使用预编译的正则表达式
     """
     if not continuation_text:
         return original_text
 
     # 清理续传响应开头可能的重复内容或提示
     continuation_clean = continuation_text.lstrip()
-
-    # 移除模型可能添加的续传引导词（使用预编译正则）
-    for pattern in _RE_CONTINUATION_INTRO:
-        match = pattern.match(continuation_clean)
+    
+    # 移除模型可能添加的续传引导词，如 "Continuing from where I left off:"
+    intro_patterns = [
+        r"^Continuing from.*?:",
+        r"^Here is the rest of the response:",
+        r"^Continuing the JSON:",
+        r"^```json\s*",
+        r"^```\s*"
+    ]
+    import re
+    for pattern in intro_patterns:
+        match = re.match(pattern, continuation_clean, re.IGNORECASE | re.DOTALL)
         if match:
             continuation_clean = continuation_clean[match.end():].lstrip()
 
@@ -2122,87 +1998,149 @@ async def fetch_with_continuation(
     headers: dict,
     request_id: str,
     model: str,
-) -> tuple[str, str, bool, dict, list]:
-    """带接续机制的请求获取
+) -> AsyncIterator[dict]:
+    """带接续机制的流式请求获取
 
-    Returns:
-        (full_text, finish_reason, stream_completed, usage_info, tool_calls)
+    Yields:
+        {"type": "text", "text": str}
+        {"type": "tool_call_delta", "tool_calls": list}
+        {"type": "usage_update", "input_tokens": int, "output_tokens": int}
+        {"type": "final_info", "full_text": str, "finish_reason": str, "completed": bool, "usage": dict, "tool_calls": list}
     """
     config = CONTINUATION_CONFIG
-    max_continuations = config.get("max_continuations", 3)
+    max_continuations = config.get("max_continuations", 10)
 
     accumulated_text = ""
     continuation_count = 0
-    consecutive_failures = 0  # 连续失败计数（用于智能停止）
     final_finish_reason = "end_turn"
     final_stream_completed = False
     total_input_tokens = 0
     total_output_tokens = 0
     aggregated_tool_calls = []
+    
+    # 用于跟踪当前工具调用的状态
+    tool_call_acc = {}
 
     current_body = dict(openai_body)
     original_messages = list(openai_body.get("messages", []))
 
     while continuation_count <= max_continuations:
-        # 发起请求
-        text, finish_reason, stream_completed, usage, tool_calls = await _fetch_single_stream(
-            current_body, headers, request_id, continuation_count
-        )
+        # 发起单次流式请求
+        current_text = ""
+        current_finish_reason = "end_turn"
+        current_stream_completed = False
+        current_status_code = 200
+        
+        async for chunk in _fetch_single_stream(current_body, headers, request_id, continuation_count):
+            chunk_type = chunk.get("type")
+            
+            if chunk_type == "text":
+                text = chunk.get("text", "")
+                current_text += text
+                yield {"type": "text", "text": text}
+                
+            elif chunk_type == "tool_call_delta":
+                deltas = chunk.get("tool_calls", [])
+                yield {"type": "tool_call_delta", "tool_calls": deltas}
+                for tc in deltas:
+                    index = tc.get("index")
+                    call_id = tc.get("id")
+                    key = call_id or f"index_{index}" if index is not None else f"idx_{len(tool_call_acc)}"
+                    entry = tool_call_acc.setdefault(key, {"id": call_id, "name": None, "arguments": ""})
+                    if call_id: entry["id"] = call_id
+                    func = tc.get("function", {}) or {}
+                    if func.get("name"): entry["name"] = func.get("name")
+                    if func.get("arguments"): entry["arguments"] += func.get("arguments")
+                    
+            elif chunk_type == "usage":
+                it = chunk.get("input_tokens", 0)
+                ot = chunk.get("output_tokens", 0)
+                total_input_tokens += it
+                total_output_tokens += ot
+                yield {"type": "usage_update", "input_tokens": total_input_tokens, "output_tokens": total_output_tokens}
+                
+            elif chunk_type == "finish":
+                current_finish_reason = chunk.get("reason", "end_turn")
+                current_stream_completed = chunk.get("completed", False)
+                current_status_code = chunk.get("status_code", 200)
 
-        # 累积 token 计数
-        total_input_tokens += usage.get("input_tokens", 0)
-        total_output_tokens += usage.get("output_tokens", 0)
-
-        # 合并响应
-        if continuation_count == 0:
-            accumulated_text = text
-        else:
-            accumulated_text = merge_responses(accumulated_text, text, request_id)
-
-        if tool_calls:
-            aggregated_tool_calls.extend(tool_calls)
-
-        # ==================== 增强错误处理 ====================
-        # 关键：如果上游返回错误，不要续传
-        if finish_reason in ("error", "timeout"):
-            logger.warning(f"[{request_id}] 上游返回错误 ({finish_reason})，停止续传")
-            final_finish_reason = "end_turn"  # 返回 end_turn 避免触发 CLI 错误
+        # 400 熔断机制：如果是 400 错误（非法请求），直接终止续传，防止死循环
+        if current_status_code == 400:
+            logger.error(f"[{request_id}] 上游返回 400 错误（非法请求），终止续传")
+            # 优雅降级：向用户发送错误提示并正常结束，避免 CLI 报错
+            error_msg = "\n\n[System Error: Upstream 400 Bad Request. The conversation history may be corrupted or too complex. Ending generation.]"
+            yield {"type": "text", "text": error_msg}
+            accumulated_text += error_msg
+            final_finish_reason = "end_turn"
             final_stream_completed = True
             break
 
-        # 检测本次请求是否获得了有效内容
-        current_text_len = len(text.strip()) if text else 0
-        if current_text_len == 0 and continuation_count > 0:
-            # 续传请求返回空内容，增加失败计数
-            consecutive_failures += 1
-            logger.warning(f"[{request_id}] 续传请求 #{continuation_count} 返回空内容，连续失败={consecutive_failures}")
+        # 403 错误（Token 过期/上下文过长）
+        if current_status_code == 403:
+            logger.error(f"[{request_id}] 上游返回 403 错误（禁止访问），终止续传")
+            error_msg = "\n\n[System Error: Upstream 403 Forbidden. The request might be too large or the token is invalid. Ending generation.]"
+            yield {"type": "text", "text": error_msg}
+            accumulated_text += error_msg
+            final_finish_reason = "end_turn"
+            final_stream_completed = True
+            break
 
-            # 检查是否超过最大连续失败次数
-            max_failures = CONTINUATION_VALIDATION.get("max_consecutive_failures", 3)
-            if consecutive_failures >= max_failures:
-                logger.error(f"[{request_id}] 连续 {consecutive_failures} 次续传失败，停止续传")
-                final_finish_reason = "end_turn"
-                final_stream_completed = True
-                break
+        # 如果单次请求由于其他错误或超时停止，且没有获取任何新内容，也直接终止续传
+        if current_finish_reason in ("error", "timeout", "stream_interrupted") and not current_text:
+            logger.error(f"[{request_id}] 续传请求 #{continuation_count} 遇到错误且无输出，终止续传: {current_finish_reason}")
+            
+            error_desc = {
+                "timeout": "Upstream Timeout",
+                "stream_interrupted": "Connection Interrupted",
+                "error": f"Upstream Error ({current_status_code})"
+            }.get(current_finish_reason, "Unknown Error")
+            
+            error_msg = f"\n\n[System Error: {error_desc}. Ending generation.]"
+            yield {"type": "text", "text": error_msg}
+            accumulated_text += error_msg
+            
+            final_finish_reason = "end_turn"
+            final_stream_completed = True
+            break
+
+        # 合并当前请求的文本到总文本
+        if continuation_count == 0:
+            accumulated_text = current_text
         else:
-            # 获得了有效内容，重置失败计数
-            consecutive_failures = 0
+            # 合并逻辑（处理重叠和引导语）
+            accumulated_text = merge_responses(accumulated_text, current_text, request_id)
 
         # 检测是否需要续传
-        truncation_info = detect_truncation(accumulated_text, stream_completed, finish_reason, request_id)
+        truncation_info = detect_truncation(accumulated_text, current_stream_completed, current_finish_reason, request_id)
 
-        if not truncation_info.is_truncated:
-            # 没有截断，正常完成
-            final_finish_reason = finish_reason
+        # 检查是否由于网络中断且没有获取任何新内容，这种情况继续续传会导致 400 错误
+        if truncation_info.reason == "stream_interrupted" and not current_text:
+             logger.warning(f"[{request_id}] 流中断且无新内容，停止续传以防 400 错误")
+             error_msg = "\n\n[System Error: Stream Interrupted (No Data). Ending generation.]"
+             yield {"type": "text", "text": error_msg}
+             accumulated_text += error_msg
+             final_finish_reason = "end_turn"
+             final_stream_completed = True
+             break
+
+        # 检查是否超过服务器端强制上限（策略：主动假死欺骗 CLI）
+        max_total = config.get("max_total_output_tokens", 20000)
+        max_chars = config.get("max_total_chars", 80000)
+        
+        if total_output_tokens >= max_total or len(accumulated_text) >= max_chars:
+            logger.warning(f"[{request_id}] 达到强制上限，主动停止续传以欺骗 CLI")
+            final_finish_reason = "end_turn"
             final_stream_completed = True
-            logger.info(f"[{request_id}] 请求完成: 无截断, 总续传次数={continuation_count}")
             break
 
-        # ==================== 智能续传决策 ====================
-        should_continue = False
-        triggers = config.get("triggers", {})
+        if not truncation_info.is_truncated:
+            final_finish_reason = current_finish_reason
+            final_stream_completed = True
+            break
 
-        # 基于触发条件判断
+        # 检查触发条件
+        triggers = config.get("triggers", {})
+        should_continue = False
         if truncation_info.reason == "stream_interrupted" and triggers.get("stream_interrupted", True):
             should_continue = True
         elif truncation_info.reason == "max_tokens_reached" and triggers.get("max_tokens_reached", True):
@@ -2212,79 +2150,31 @@ async def fetch_with_continuation(
         elif "tool_parse_error" in str(truncation_info.reason) and triggers.get("parse_error", True):
             should_continue = True
 
-        # 额外检查：如果累积文本为空或过短，不应续传
-        accumulated_len = len(accumulated_text.strip()) if accumulated_text else 0
-        min_text_for_continuation = CONTINUATION_VALIDATION.get("min_text_length", 10)
-        if accumulated_len < min_text_for_continuation:
-            logger.warning(f"[{request_id}] 累积文本过短 ({accumulated_len} < {min_text_for_continuation})，停止续传")
-            should_continue = False
-
-        if not should_continue:
-            logger.info(f"[{request_id}] 截断但不续传: reason={truncation_info.reason}, accumulated_len={accumulated_len}")
-            final_finish_reason = finish_reason
-            final_stream_completed = stream_completed
+        if not should_continue or continuation_count >= max_continuations:
+            final_finish_reason = current_finish_reason
+            final_stream_completed = current_stream_completed
             break
 
-        if continuation_count >= max_continuations:
-            logger.warning(f"[{request_id}] 达到最大续传次数 {max_continuations}，停止续传")
-            final_finish_reason = "end_turn"  # 不返回 max_tokens，避免触发 CLI 错误
-            final_stream_completed = False
-            break
-
-        # ==================== 关键修复：构建续传请求（带验证） ====================
+        # 构建续传请求
         logger.info(f"[{request_id}] 触发续传 #{continuation_count + 1}: reason={truncation_info.reason}")
-
-        # 使用新的验证版本构建续传请求
-        continuation_result = build_continuation_request(
+        current_body = build_continuation_request(
             original_messages,
             accumulated_text,
             openai_body,
             continuation_count,
             request_id
         )
-
-        # 检查返回值类型（兼容新旧版本）
-        if isinstance(continuation_result, tuple):
-            # 新版本：返回 (body, should_continue, reason)
-            new_body, should_build, build_reason = continuation_result
-            if not should_build or new_body is None:
-                logger.warning(f"[{request_id}] 续传请求构建失败: {build_reason}，停止续传")
-                final_finish_reason = "end_turn"
-                final_stream_completed = True
-                break
-            current_body = new_body
-        else:
-            # 旧版本兼容：直接返回 body
-            current_body = continuation_result
-
         continuation_count += 1
 
-    # ==================== 完成日志和降级处理 ====================
-    final_text_len = len(accumulated_text.strip()) if accumulated_text else 0
-    final_tool_count = len(aggregated_tool_calls)
-
-    # 判断是否需要降级处理
-    if final_text_len == 0 and final_tool_count == 0 and continuation_count > 0:
-        # 多次续传后仍然没有有效内容，记录详细警告
-        logger.error(f"[{request_id}] ⚠️ 续传失败: {continuation_count} 次续传后无有效内容")
-        # 降级策略：返回友好的错误提示而不是空响应
-        accumulated_text = "[系统提示] 请求处理遇到问题，请稍后重试或简化您的请求。"
-        final_finish_reason = "end_turn"
-        final_stream_completed = True
-    elif continuation_count > 0:
-        logger.info(f"[{request_id}] 🔄 接续完成: {continuation_count} 次续传, "
-                    f"最终文本长度={final_text_len}, 工具调用={final_tool_count}")
-    else:
-        logger.info(f"[{request_id}] ✅ 请求完成: 无需续传, "
-                    f"文本长度={final_text_len}, 工具调用={final_tool_count}")
-
-    return accumulated_text, final_finish_reason, final_stream_completed, {
-        "input_tokens": total_input_tokens,
-        "output_tokens": total_output_tokens,
-        "continuation_count": continuation_count,
-        "consecutive_failures": consecutive_failures,
-        "final_text_length": final_text_len,
-    }, aggregated_tool_calls
+    # 最后 yield 完整的聚类信息，供外部解析使用
+    yield {
+        "type": "final_info",
+        "full_text": accumulated_text,
+        "finish_reason": final_finish_reason,
+        "completed": final_stream_completed,
+        "usage": {"input_tokens": total_input_tokens, "output_tokens": total_output_tokens, "continuation_count": continuation_count},
+        "tool_calls": list(tool_call_acc.values())
+    }
 
 
 async def _fetch_single_stream(
@@ -2292,18 +2182,21 @@ async def _fetch_single_stream(
     headers: dict,
     request_id: str,
     continuation_count: int
-) -> tuple[str, str, bool, dict, list]:
-    """执行单次流式请求
+) -> AsyncIterator[dict]:
+    """执行单次流式请求，并作为异步生成器产生内容块
 
-    Returns:
-        (text, finish_reason, stream_completed, usage, tool_calls)
+    Yields:
+        {"type": "text", "text": str}
+        {"type": "tool_call_delta", "tool_calls": list}
+        {"type": "usage", "input_tokens": int, "output_tokens": int}
+        {"type": "finish", "reason": str, "completed": bool, "status_code": int}
     """
-    full_text = ""
     finish_reason = "end_turn"
     stream_completed = False
     input_tokens = 0
     output_tokens = 0
     tool_call_acc = {}
+    status_code = 200
 
     try:
         client = get_http_client()
@@ -2313,61 +2206,13 @@ async def _fetch_single_stream(
             json=openai_body,
             headers=headers,
         ) as response:
+            status_code = response.status_code
             if response.status_code != 200:
                 error_text = await response.aread()
                 error_str = error_text.decode()
-
-                # ==================== 增强错误分类和日志 ====================
-                error_msg = error_str[:500]
-                error_type = "unknown"
-                is_retryable = False
-
-                try:
-                    error_json = json.loads(error_str)
-                    error_msg = error_json.get("error", {}).get("message", error_str[:500])
-                    # error_code 和 error_param 可用于未来扩展
-                    # error_code = error_json.get("error", {}).get("code")
-                    # error_param = error_json.get("error", {}).get("param")
-
-                    # 分类错误类型
-                    if "Improperly formed request" in error_msg:
-                        error_type = "malformed_request"
-                        is_retryable = False
-                        logger.error(f"[{request_id}] ❌ 请求格式错误 (续传 #{continuation_count}): {error_msg[:200]}")
-                    elif "token" in error_msg.lower() or "没有可用" in error_msg:
-                        error_type = "token_exhausted"
-                        is_retryable = False
-                        logger.error(f"[{request_id}] ❌ Token 耗尽 (续传 #{continuation_count}): {error_msg[:200]}")
-                    elif "rate limit" in error_msg.lower() or "too many" in error_msg.lower():
-                        error_type = "rate_limit"
-                        is_retryable = True
-                        logger.warning(f"[{request_id}] ⚠️ 速率限制 (续传 #{continuation_count}): {error_msg[:200]}")
-                    elif "timeout" in error_msg.lower():
-                        error_type = "timeout"
-                        is_retryable = True
-                        logger.warning(f"[{request_id}] ⚠️ 超时 (续传 #{continuation_count}): {error_msg[:200]}")
-                    elif response.status_code == 400:
-                        error_type = "bad_request"
-                        is_retryable = False
-                        logger.error(f"[{request_id}] ❌ 错误请求 (续传 #{continuation_count}): {error_msg[:200]}")
-                    elif response.status_code >= 500:
-                        error_type = "server_error"
-                        is_retryable = True
-                        logger.warning(f"[{request_id}] ⚠️ 服务器错误 (续传 #{continuation_count}): {error_msg[:200]}")
-                    else:
-                        logger.error(f"[{request_id}] ❌ 未知错误 (续传 #{continuation_count}): status={response.status_code}, msg={error_msg[:200]}")
-
-                except json.JSONDecodeError:
-                    logger.error(f"[{request_id}] ❌ 无法解析错误响应 (续传 #{continuation_count}): {error_str[:200]}")
-
-                # 返回错误信息，包含错误类型以便上层决策
-                return f"[上游服务错误] {error_msg}", "error", True, {
-                    "input_tokens": 0,
-                    "output_tokens": 0,
-                    "error_type": error_type,
-                    "is_retryable": is_retryable,
-                    "status_code": response.status_code,
-                }, []
+                logger.error(f"[{request_id}] 续传请求 #{continuation_count} 失败: {response.status_code} - {error_str[:200]}")
+                yield {"type": "finish", "reason": "error", "completed": False, "status_code": status_code}
+                return
 
             buffer = ""
             try:
@@ -2390,8 +2235,12 @@ async def _fetch_single_stream(
                             # 获取 usage
                             usage = data.get("usage")
                             if usage:
-                                input_tokens = usage.get("prompt_tokens", input_tokens)
-                                output_tokens = usage.get("completion_tokens", output_tokens)
+                                it = usage.get("prompt_tokens", 0)
+                                ot = usage.get("completion_tokens", 0)
+                                if it or ot:
+                                    input_tokens = it or input_tokens
+                                    output_tokens = ot or output_tokens
+                                    yield {"type": "usage", "input_tokens": it, "output_tokens": ot}
 
                             choice = data.get("choices", [{}])[0]
                             delta = choice.get("delta", {})
@@ -2402,32 +2251,34 @@ async def _fetch_single_stream(
                                 if fr == "tool_calls":
                                     finish_reason = "tool_use"
                                 elif fr == "length":
-                                    finish_reason = "end_turn"  # 不返回 max_tokens，续传机制会处理
+                                    finish_reason = "max_tokens"
                                 elif fr == "stop":
                                     finish_reason = "end_turn"
 
                             content = delta.get("content", "")
                             if content:
-                                full_text += content
+                                yield {"type": "text", "text": content}
 
                             delta_tool_calls = delta.get("tool_calls", []) or []
-                            for tc in delta_tool_calls:
-                                index = tc.get("index")
-                                call_id = tc.get("id")
-                                key = call_id or f"index_{index}" if index is not None else None
-                                if not key:
-                                    key = f"idx_{len(tool_call_acc)}"
-                                entry = tool_call_acc.setdefault(
-                                    key,
-                                    {"id": call_id or f"toolu_{uuid.uuid4().hex[:12]}", "name": None, "arguments": ""}
-                                )
-                                if call_id:
-                                    entry["id"] = call_id
-                                func = tc.get("function", {}) or {}
-                                if func.get("name"):
-                                    entry["name"] = func.get("name")
-                                if func.get("arguments"):
-                                    entry["arguments"] += func.get("arguments")
+                            if delta_tool_calls:
+                                yield {"type": "tool_call_delta", "tool_calls": delta_tool_calls}
+                                for tc in delta_tool_calls:
+                                    index = tc.get("index")
+                                    call_id = tc.get("id")
+                                    key = call_id or f"index_{index}" if index is not None else None
+                                    if not key:
+                                        key = f"idx_{len(tool_call_acc)}"
+                                    entry = tool_call_acc.setdefault(
+                                        key,
+                                        {"id": call_id or f"toolu_{uuid.uuid4().hex[:12]}", "name": None, "arguments": ""}
+                                    )
+                                    if call_id:
+                                        entry["id"] = call_id
+                                    func = tc.get("function", {}) or {}
+                                    if func.get("name"):
+                                        entry["name"] = func.get("name")
+                                    if func.get("arguments"):
+                                        entry["arguments"] += func.get("arguments")
 
                         except json.JSONDecodeError:
                             pass
@@ -2435,25 +2286,18 @@ async def _fetch_single_stream(
             except (httpx.RemoteProtocolError, httpx.ReadError) as e:
                 logger.error(f"[{request_id}] 续传请求 #{continuation_count} 流中断: {type(e).__name__}")
                 stream_completed = False
+                finish_reason = "stream_interrupted"
 
     except httpx.TimeoutException:
         logger.error(f"[{request_id}] 续传请求 #{continuation_count} 超时")
-        return full_text, "timeout", False, {"input_tokens": input_tokens, "output_tokens": output_tokens}, []
+        yield {"type": "finish", "reason": "timeout", "completed": False, "status_code": 408}
+        return
     except Exception as e:
         logger.error(f"[{request_id}] 续传请求 #{continuation_count} 异常: {type(e).__name__}: {e}")
-        return full_text, "error", False, {"input_tokens": input_tokens, "output_tokens": output_tokens}, []
+        yield {"type": "finish", "reason": "error", "completed": False, "status_code": 500}
+        return
 
-    # 估算 token（如果 API 没返回）
-    if output_tokens == 0:
-        output_tokens = estimate_tokens(full_text)
-
-    logger.info(f"[{request_id}] 续传请求 #{continuation_count} 完成: "
-                f"text_len={len(full_text)}, finish={finish_reason}, completed={stream_completed}")
-
-    return full_text, finish_reason, stream_completed, {
-        "input_tokens": input_tokens,
-        "output_tokens": output_tokens
-    }, list(tool_call_acc.values())
+    yield {"type": "finish", "reason": finish_reason, "completed": stream_completed, "status_code": status_code}
 
 
 def convert_openai_to_anthropic(openai_response: dict, model: str, request_id: str) -> dict:
@@ -2499,7 +2343,7 @@ def convert_openai_to_anthropic(openai_response: dict, model: str, request_id: s
     if finish_reason == "tool_calls":
         stop_reason = "tool_use"
     elif finish_reason == "length":
-        stop_reason = "end_turn"  # 不返回 max_tokens，避免触发 Claude Code CLI 错误
+        stop_reason = "max_tokens"
     elif finish_reason == "stop" and stop_reason != "tool_use":
         stop_reason = "end_turn"
 
@@ -2518,6 +2362,112 @@ def convert_openai_to_anthropic(openai_response: dict, model: str, request_id: s
     }
 
 
+def convert_anthropic_to_openai_simple(anthropic_body: dict) -> dict:
+    """最简单的 Anthropic -> OpenAI 转换，带截断保护"""
+
+    # 截断配置
+    MAX_MESSAGES = 20          # 最大消息数（不含 system）
+    MAX_TOTAL_CHARS = 80000    # 最大总字符数
+    MAX_SINGLE_CONTENT = 30000 # 单条消息最大字符数
+
+    messages = []
+
+    # 处理 system 消息
+    system = anthropic_body.get("system", "")
+    if system:
+        if isinstance(system, str):
+            system_content = system
+        elif isinstance(system, list):
+            parts = []
+            for item in system:
+                if isinstance(item, dict) and "text" in item:
+                    parts.append(item["text"])
+                elif isinstance(item, str):
+                    parts.append(item)
+            system_content = "\n".join(parts)
+        else:
+            system_content = str(system)
+
+        if system_content.strip():
+            # 截断过长的 system 消息
+            if len(system_content) > MAX_SINGLE_CONTENT:
+                system_content = system_content[:MAX_SINGLE_CONTENT] + "\n...[truncated]"
+            messages.append({"role": "system", "content": system_content})
+
+    # 转换 messages
+    raw_messages = anthropic_body.get("messages", [])
+
+    # 如果消息太多，只保留最近的
+    if len(raw_messages) > MAX_MESSAGES:
+        raw_messages = raw_messages[-MAX_MESSAGES:]
+
+    for msg in raw_messages:
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+
+        # 处理 content
+        if isinstance(content, list):
+            text_parts = []
+            for item in content:
+                if isinstance(item, dict):
+                    if item.get("type") == "text":
+                        text_parts.append(item.get("text", ""))
+                    elif item.get("type") == "tool_result":
+                        result_content = item.get("content", "")
+                        if isinstance(result_content, str):
+                            text_parts.append(result_content)
+                        elif isinstance(result_content, list):
+                            for rc in result_content:
+                                if isinstance(rc, dict) and rc.get("type") == "text":
+                                    text_parts.append(rc.get("text", ""))
+                elif isinstance(item, str):
+                    text_parts.append(item)
+            content = "\n".join(filter(None, text_parts))
+
+        # 确保 content 非空
+        if not content or not content.strip():
+            content = " "
+
+        # 截断过长的单条消息
+        if len(content) > MAX_SINGLE_CONTENT:
+            content = content[:MAX_SINGLE_CONTENT] + "\n...[truncated]"
+
+        messages.append({"role": role, "content": content})
+
+    # 确保至少有一条消息
+    if not messages:
+        messages.append({"role": "user", "content": "Hello"})
+
+    # 检查总字符数，如果超过则进一步截断
+    total_chars = sum(len(m.get("content", "")) for m in messages)
+    while total_chars > MAX_TOTAL_CHARS and len(messages) > 2:
+        # 保留 system（如果有）和最后一条消息，删除最早的非 system 消息
+        if messages[0].get("role") == "system":
+            if len(messages) > 2:
+                messages.pop(1)
+        else:
+            messages.pop(0)
+        total_chars = sum(len(m.get("content", "")) for m in messages)
+
+    # 构建 OpenAI 请求
+    openai_body = {
+        "model": anthropic_body.get("model", "claude-sonnet-4"),
+        "messages": messages,
+        "stream": anthropic_body.get("stream", False),
+    }
+
+    # 流式响应时，请求包含 usage 信息
+    if anthropic_body.get("stream", False):
+        openai_body["stream_options"] = {"include_usage": True}
+
+    if "max_tokens" in anthropic_body:
+        openai_body["max_tokens"] = anthropic_body["max_tokens"]
+    if "temperature" in anthropic_body:
+        openai_body["temperature"] = anthropic_body["temperature"]
+
+    return openai_body
+
+
 @app.post("/v1/messages")
 async def anthropic_messages(request: Request):
     """Anthropic /v1/messages 端点 - 通过 OpenAI 格式发送到 tokens 网关"""
@@ -2533,14 +2483,18 @@ async def anthropic_messages(request: Request):
     orig_msg_count = len(body.get("messages", []))
 
     # ==================== max_tokens 处理 ====================
-    # 确保有合理的 max_tokens，防止响应被意外截断
+    # 确保有合理的 max_tokens，同时防止单次请求直接超过 CLI 的 32000 限制
     DEFAULT_MAX_TOKENS = 16384  # 16K tokens 作为默认值
-    MAX_ALLOWED_TOKENS = 64000  # 64K tokens 上限
-
+    MAX_CLI_SAFE_TOKENS = 28000  # 设置一个比 32000 更有余量的安全值
+    
     original_max_tokens = body.get("max_tokens")
     if original_max_tokens is None:
         body["max_tokens"] = DEFAULT_MAX_TOKENS
         logger.info(f"[{request_id}] 设置默认 max_tokens: {DEFAULT_MAX_TOKENS}")
+    elif original_max_tokens > MAX_CLI_SAFE_TOKENS:
+        # 强制收缩 max_tokens，防止单次生成就溢出
+        body["max_tokens"] = MAX_CLI_SAFE_TOKENS
+        logger.warning(f"[{request_id}] 强制收缩 max_tokens: {original_max_tokens} -> {MAX_CLI_SAFE_TOKENS}")
     elif original_max_tokens < 1000:
         # 如果设置得太小，可能导致截断
         logger.warning(f"[{request_id}] max_tokens 较小 ({original_max_tokens})，可能导致响应截断")
@@ -2550,7 +2504,7 @@ async def anthropic_messages(request: Request):
 
     # ==================== 智能模型路由 ====================
     # 对 Opus 请求进行智能降级判断
-    routed_model, route_reason = await model_router.route(body)
+    routed_model, route_reason = model_router.route(body)
 
     if routed_model != original_model:
         logger.info(f"[{request_id}] 🔀 模型路由: {original_model} -> {routed_model} ({route_reason})")
@@ -2561,39 +2515,6 @@ async def anthropic_messages(request: Request):
         model = original_model
         if "opus" in original_model.lower():
             logger.info(f"[{request_id}] ✅ 保留 Opus: {route_reason}")
-
-    # ==================== 历史消息管理 ====================
-    # 创建历史管理器（与 /v1/chat/completions 保持一致）
-    session_id = generate_session_id(body.get("messages", []))
-    manager = HistoryManager(HISTORY_CONFIG, cache_key=session_id)
-
-    # 预处理消息（截断/摘要）
-    messages = body.get("messages", [])
-    user_content = extract_user_content(messages)
-
-    # 计算原始消息大小
-    original_chars = len(json.dumps(messages, ensure_ascii=False))
-    logger.info(f"[{request_id}] 原始消息: {len(messages)} 条, {original_chars} 字符")
-
-    # 检查是否需要截断/摘要
-    should_summarize = manager.should_summarize(messages)
-    logger.info(f"[{request_id}] 需要摘要: {should_summarize}, 阈值: {HISTORY_CONFIG.summary_threshold}")
-
-    if should_summarize:
-        logger.info(f"[{request_id}] 触发智能摘要...")
-        processed_messages = await manager.pre_process_async(
-            messages, user_content, call_kiro_for_summary
-        )
-    else:
-        processed_messages = manager.pre_process(messages, user_content)
-
-    if manager.was_truncated:
-        logger.info(f"[{request_id}] ✂️ {manager.truncate_info}")
-    else:
-        logger.info(f"[{request_id}] 无需截断")
-
-    # 更新 body 中的 messages
-    body["messages"] = processed_messages
 
     # 使用完整转换（包含截断和空消息过滤）
     openai_body = convert_anthropic_to_openai(body)
@@ -2606,28 +2527,21 @@ async def anthropic_messages(request: Request):
 
     # 保存调试文件（仅保留最近几个）
     debug_dir = "/tmp/ai-history-debug"
+    import os
     os.makedirs(debug_dir, exist_ok=True)
     try:
         with open(f"{debug_dir}/{request_id}_converted.json", "w") as f:
             json.dump(openai_body, f, indent=2, ensure_ascii=False)
-        # 清理旧文件（保留最近 10 个）- 处理并发删除的竞态条件
-        try:
-            debug_files = sorted(
-                [f for f in os.listdir(debug_dir) if f.endswith('.json')],
-                key=lambda x: os.path.getmtime(os.path.join(debug_dir, x)),
-                reverse=True
-            )
-            for old_file in debug_files[10:]:
-                try:
-                    os.remove(os.path.join(debug_dir, old_file))
-                except FileNotFoundError:
-                    pass  # 已被其他请求删除
-                except OSError:
-                    pass  # 其他文件系统错误
-        except OSError:
-            pass  # 目录列表失败
-    except Exception:
-        pass  # 非关键操作，忽略所有错误
+        # 清理旧文件（保留最近 10 个）
+        debug_files = sorted(
+            [f for f in os.listdir(debug_dir) if f.endswith('.json')],
+            key=lambda x: os.path.getmtime(os.path.join(debug_dir, x)),
+            reverse=True
+        )
+        for old_file in debug_files[10:]:
+            os.remove(os.path.join(debug_dir, old_file))
+    except:
+        pass
 
     # 构建请求头 - 添加唯一标识让 tokens 区分不同请求
     # 关键：每个请求使用不同的 X-Request-ID 和 X-Trace-ID
@@ -2695,149 +2609,75 @@ async def handle_anthropic_stream_via_openai(
             }
             yield f"data: {json.dumps(msg_start)}\n\n".encode()
 
-            # ========== 智能接续机制 ==========
-            # 使用 fetch_with_continuation 获取完整响应（自动处理截断和续传）
-            if CONTINUATION_CONFIG.get("enabled", True):
-                full_text, finish_reason, stream_completed, usage_info, tool_calls = await fetch_with_continuation(
-                    openai_body, headers, request_id, model
-                )
-                input_tokens = usage_info.get("input_tokens", estimated_input_tokens)
-                output_tokens = usage_info.get("output_tokens", 0)
-                continuation_count = usage_info.get("continuation_count", 0)
-
-                if continuation_count > 0:
-                    logger.info(f"[{request_id}] 🔄 接续完成: {continuation_count} 次续传, "
-                                f"最终文本长度={len(full_text)}")
-            else:
-                # 接续机制禁用，使用单次请求
-                full_text, finish_reason, stream_completed, usage_info, tool_calls = await _fetch_single_stream(
-                    openai_body, headers, request_id, 0
-                )
-                input_tokens = usage_info.get("input_tokens", estimated_input_tokens)
-                output_tokens = usage_info.get("output_tokens", 0)
-
-            # 检测最终响应是否仍有截断（接续后仍可能有问题）
-            truncation_info = detect_truncation(full_text, stream_completed, finish_reason, request_id)
-
-            # 解析内联工具调用（保序）
-            blocks = parse_inline_tool_blocks(full_text)
-            tool_call_blocks = tool_calls_to_blocks(tool_calls or [])
-            if tool_call_blocks:
-                blocks.extend(tool_call_blocks)
-            blocks = expand_thinking_blocks(blocks)
-
-            # 处理截断情况
-            if truncation_info.is_truncated:
-                # 过滤掉解析失败的工具调用
-                valid_tools = []
-                tool_call_ids = {b.get("id") for b in tool_call_blocks if b.get("id")}
-                for tu in (b for b in blocks if b.get("type") == "tool_use"):
-                    inp = tu.get("input", {})
-                    if tu.get("id") in tool_call_ids:
-                        valid_tools.append(tu)
-                    elif isinstance(inp, dict) and ("_parse_error" not in inp and "_raw" not in inp):
-                        valid_tools.append(tu)
-                    else:
-                        logger.warning(f"[{request_id}] 丢弃无效工具调用: {tu.get('name')} - "
-                                       f"{inp.get('_parse_error', 'unknown error')[:100]}")
-
-                if valid_tools:
-                    blocks = [b for b in blocks if b.get("type") != "tool_use"] + valid_tools
-                    logger.info(f"[{request_id}] 恢复 {len(valid_tools)} 个有效工具调用")
-                else:
-                    # 所有工具调用都失败，且确实发生了截断，才添加警告
-                    blocks = [{"type": "text", "text": full_text}]
-                    logger.warning(f"[{request_id}] 所有工具调用解析失败，回退为纯文本响应")
-                    # 不添加 [⚠️ Response truncated: ...] 标记
-                    # 原因：Claude Code CLI 会解析这个格式并显示为 API 错误
-                    # 即使响应被截断，也让续传机制处理，不要触发 CLI 错误提示
-                    pass
-
-            # 发送 content blocks（保序）
+            # ========== 智能接续机制 (流式转发) ==========
+            full_text = ""
+            finish_reason = "end_turn"
+            stream_completed = True
+            tool_calls = []
+            output_tokens = 0
+            
             block_index = 0
-            emitted_block = False
-
-            for block in blocks:
-                if block.get("type") == "text":
-                    text_value = block.get("text", "")
-                    if not text_value:
-                        continue
-                    emitted_block = True
-                    yield (
-                        f'data: {{"type":"content_block_start","index":{block_index},"content_block":'
-                        f'{{"type":"text","text":""}}}}\n\n'
-                    ).encode()
-                    for chunk in iter_text_chunks(text_value, STREAM_TEXT_CHUNK_SIZE):
+            text_block_started = False
+            
+            async for chunk in fetch_with_continuation(openai_body, headers, request_id, model):
+                chunk_type = chunk.get("type")
+                
+                if chunk_type == "text":
+                    text = chunk.get("text", "")
+                    if text:
+                        if not text_block_started:
+                            yield f'data: {{"type":"content_block_start","index":{block_index},"content_block":{{"type":"text","text":""}}}}\n\n'.encode()
+                            text_block_started = True
+                        
+                        # 流式发送文本 delta
                         delta_event = {
                             "type": "content_block_delta",
                             "index": block_index,
-                            "delta": {"type": "text_delta", "text": chunk}
+                            "delta": {"type": "text_delta", "text": text}
                         }
                         yield f"data: {json.dumps(delta_event)}\n\n".encode()
-                    yield f'data: {{"type":"content_block_stop","index":{block_index}}}\n\n'.encode()
-                    block_index += 1
-                elif block.get("type") == "thinking":
-                    thinking_value = block.get("thinking", "")
-                    if not thinking_value:
-                        continue
-                    emitted_block = True
-                    yield (
-                        f'data: {{"type":"content_block_start","index":{block_index},"content_block":'
-                        f'{{"type":"thinking","thinking":""}}}}\n\n'
-                    ).encode()
-                    for chunk in iter_text_chunks(thinking_value, STREAM_THINKING_CHUNK_SIZE):
-                        delta_event = {
-                            "type": "content_block_delta",
-                            "index": block_index,
-                            "delta": {"type": "thinking_delta", "thinking": chunk}
-                        }
-                        yield f"data: {json.dumps(delta_event)}\n\n".encode()
-                    yield f'data: {{"type":"content_block_stop","index":{block_index}}}\n\n'.encode()
-                    block_index += 1
-                elif block.get("type") == "tool_use":
-                    emitted_block = True
-                    finish_reason = "tool_use"
-                    tool_start = {
-                        "type": "content_block_start",
-                        "index": block_index,
-                        "content_block": {
-                            "type": "tool_use",
-                            "id": block["id"],
-                            "name": block["name"],
-                            "input": {}
-                        }
-                    }
-                    yield f"data: {json.dumps(tool_start)}\n\n".encode()
+                
+                elif chunk_type == "tool_call_delta":
+                    # 注意：流式转发工具调用需要更复杂的索引管理，这里暂时透传
+                    # 实际内联工具调用目前主要在 final_info 中处理
+                    pass
+                    
+                elif chunk_type == "usage_update":
+                    output_tokens = chunk.get("output_tokens", output_tokens)
+                    
+                elif chunk_type == "final_info":
+                    full_text = chunk.get("full_text", "")
+                    finish_reason = chunk.get("finish_reason", "end_turn")
+                    stream_completed = chunk.get("completed", True)
+                    tool_calls = chunk.get("tool_calls", [])
+                    usage_info = chunk.get("usage", {})
+                    output_tokens = usage_info.get("output_tokens", output_tokens)
 
-                    tool_json = json.dumps(block.get("input", {}))
-                    for chunk in iter_text_chunks(tool_json, STREAM_TOOL_JSON_CHUNK_SIZE):
-                        delta_event = {
-                            "type": "content_block_delta",
-                            "index": block_index,
-                            "delta": {"type": "input_json_delta", "partial_json": chunk}
-                        }
-                        yield f"data: {json.dumps(delta_event)}\n\n".encode()
+            if text_block_started:
+                yield f'data: {{"type":"content_block_stop","index":{block_index}}}\n\n'.encode()
+                block_index += 1
 
-                    yield f'data: {{"type":"content_block_stop","index":{block_index}}}\n\n'.encode()
-                    block_index += 1
+            # 处理最终的工具调用（如果 fetch_with_continuation 发现了完整工具调用）
+            for tc in tool_calls:
+                # 发送 tool_use block
+                yield f'data: {{"type":"content_block_start","index":{block_index},"content_block":{{"type":"tool_use","id":"{tc["id"]}","name":"{tc["name"]}","input":{{}}}}}}\n\n'.encode()
+                
+                tool_json = json.dumps(tc.get("input", tc.get("arguments", {})))
+                yield f'data: {{"type":"content_block_delta","index":{block_index},"delta":{{"type":"input_json_delta","partial_json":{json.dumps(tool_json)}}}}}\n\n'.encode()
+                yield f'data: {{"type":"content_block_stop","index":{block_index}}}\n\n'.encode()
+                block_index += 1
 
-            if not emitted_block:
-                yield f'data: {{"type":"content_block_start","index":0,"content_block":{{"type":"text","text":""}}}}\n\n'.encode()
-                yield f'data: {{"type":"content_block_stop","index":0}}\n\n'.encode()
-
-            # 如果 OpenAI 没有返回 usage，使用估算值
-            if output_tokens == 0:
-                output_tokens = estimate_tokens(full_text)
-
-            # 如果检测到截断，记录详细信息
-            if truncation_info.is_truncated:
-                tool_count = len([b for b in blocks if b.get("type") == "tool_use"])
-                logger.warning(f"[{request_id}] ⚠️ 响应截断完成: reason={truncation_info.reason}, "
-                               f"text_len={len(full_text)}, tools={tool_count}, "
-                               f"finish_reason={finish_reason}")
-
-            # message delta with token usage
-            yield f'data: {{"type":"message_delta","delta":{{"stop_reason":"{finish_reason}","stop_sequence":null}},"usage":{{"output_tokens":{output_tokens}}}}}\n\n'.encode()
+            # 最终 usage 信息
+            safe_output_tokens = min(output_tokens, 31000)
+            
+            # 确保 stop_reason 是合法的 Anthropic 值
+            valid_reasons = ["end_turn", "max_tokens", "stop_sequence", "tool_use"]
+            if finish_reason not in valid_reasons:
+                # 如果是其他值（如 error, timeout），回退到 end_turn
+                finish_reason = "end_turn"
+                
+            yield f'data: {{"type":"message_delta","delta":{{"stop_reason":"{finish_reason}","stop_sequence":null}},"usage":{{"output_tokens":{safe_output_tokens}}}}}\n\n'.encode()
+            yield f'data: {{"type":"message_stop"}}\n\n'.encode()
 
             # message stop
             yield f'data: {{"type":"message_stop"}}\n\n'.encode()

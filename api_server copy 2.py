@@ -48,9 +48,8 @@ CONTINUATION_CONFIG = {
     "enabled": os.getenv("CONTINUATION_ENABLED", "true").lower() in ("1", "true", "yes"),
 
     # 最大续传次数（防止无限循环）
-    # 优化：从 15 降低到 5，配合空响应验证可以更快失败
-    # 如果需要处理超长输出，可以通过环境变量调整
-    "max_continuations": int(os.getenv("MAX_CONTINUATIONS", "5")),
+    # 默认增加到 15 次，以应对超长输出（如 6000+ 行代码文件）
+    "max_continuations": int(os.getenv("MAX_CONTINUATIONS", "15")),
 
     # 触发续传的条件
     "triggers": {
@@ -91,20 +90,21 @@ Continue from here:""",
 }
 
 # 历史消息管理配置
-# 优化配置：平衡上下文保留和稳定性
+# 调整阈值，更早触发截断以避免 "Input is too long" 错误
 HISTORY_CONFIG = HistoryConfig(
     strategies=[
-        TruncateStrategy.AUTO_TRUNCATE,     # 自动截断 - 发送前优先保留最新上下文
-        TruncateStrategy.SMART_SUMMARY,     # 智能摘要 - 用 AI 生成早期对话摘要
-        TruncateStrategy.ERROR_RETRY,       # 错误重试 - 遇到长度错误时截断后重试（推荐）
+        TruncateStrategy.PRE_ESTIMATE,      # 优先预估，提前截断
+        TruncateStrategy.AUTO_TRUNCATE,     # 自动截断
+        TruncateStrategy.SMART_SUMMARY,     # 智能摘要
+        TruncateStrategy.ERROR_RETRY,       # 错误重试
     ],
-    max_messages=30,           # 最大消息数
-    max_chars=150000,          # 最大字符数
-    summary_keep_recent=10,    # 保留最近 10 条消息完整
-    summary_threshold=100000,  # 触发摘要阈值（字符）
-    retry_max_messages=20,     # 重试时保留消息数
-    max_retries=2,             # 最大重试次数
-    estimate_threshold=150000, # 预估截断阈值
+    max_messages=25,           # 30 → 25，减少最大消息数
+    max_chars=100000,          # 150000 → 100000，降低字符上限
+    summary_keep_recent=8,     # 10 → 8，保留更少的最近消息
+    summary_threshold=80000,   # 100000 → 80000，更早触发摘要
+    retry_max_messages=15,     # 20 → 15，重试时保留更少消息
+    max_retries=3,             # 2 → 3，增加重试次数
+    estimate_threshold=100000, # 180000 → 100000，更早预估截断
     summary_cache_enabled=True,
     add_warning_header=True,
 )
@@ -312,19 +312,21 @@ class ModelRouter:
 
     def _count_files_mentioned(self, messages: list) -> int:
         """统计提及的文件数量（简单估算）"""
+        import re
         files = set()
+        file_pattern = r'[/\\][\w\-\.]+\.(py|js|ts|jsx|tsx|go|rs|java|cpp|c|h|md|yaml|yml|json|toml)'
 
         for msg in messages:
             content = msg.get("content", "")
             if isinstance(content, str):
-                matches = _RE_FILE_PATH.findall(content)
+                matches = re.findall(file_pattern, content)
                 files.update(matches)
             elif isinstance(content, list):
                 for item in content:
                     if isinstance(item, dict):
                         text = item.get("text", "") or item.get("content", "")
                         if isinstance(text, str):
-                            matches = _RE_FILE_PATH.findall(text)
+                            matches = re.findall(file_pattern, text)
                             files.update(matches)
         return len(files)
 
@@ -344,24 +346,12 @@ class ModelRouter:
         return ""
 
     def _contains_keywords(self, text: str, keywords: list) -> bool:
-        """检查文本是否包含关键词（兼容旧接口）"""
+        """检查文本是否包含关键词"""
         text_lower = text.lower()
         for kw in keywords:
             if kw.lower() in text_lower:
                 return True
         return False
-
-    def _contains_keywords_optimized(self, text: str, keywords_lower: list) -> tuple[bool, str]:
-        """优化版关键词检查，使用预处理的小写关键词列表
-
-        Returns:
-            (found, matched_keyword)
-        """
-        text_lower = text.lower()
-        for kw in keywords_lower:
-            if kw in text_lower:
-                return True, kw
-        return False, ""
 
     def _count_user_messages(self, messages: list) -> int:
         """统计用户消息数量"""
@@ -453,18 +443,21 @@ class ModelRouter:
                     return True, f"主Agent首轮({main_agent_prob}%)"
 
         # ============================================================
-        # 第一优先级：强制 Opus 关键词（使用预处理的小写关键词）
+        # 第一优先级：强制 Opus 关键词
         # ============================================================
-        found, matched_kw = self._contains_keywords_optimized(last_user_msg, self._opus_keywords_lower)
-        if found:
-            return True, f"关键词[{matched_kw}]"
+        force_opus_keywords = self.config.get("force_opus_keywords", [])
+        if self._contains_keywords(last_user_msg, force_opus_keywords):
+            # 找出匹配的关键词
+            matched = [kw for kw in force_opus_keywords if kw.lower() in last_user_msg.lower()]
+            return True, f"关键词[{matched[0] if matched else '?'}]"
 
         # ============================================================
-        # 第二优先级：强制 Sonnet 关键词（使用预处理的小写关键词）
+        # 第二优先级：强制 Sonnet 关键词
         # ============================================================
-        found, matched_kw = self._contains_keywords_optimized(last_user_msg, self._sonnet_keywords_lower)
-        if found:
-            return False, f"简单任务[{matched_kw}]"
+        force_sonnet_keywords = self.config.get("force_sonnet_keywords", [])
+        if self._contains_keywords(last_user_msg, force_sonnet_keywords):
+            matched = [kw for kw in force_sonnet_keywords if kw.lower() in last_user_msg.lower()]
+            return False, f"简单任务[{matched[0] if matched else '?'}]"
 
         # ============================================================
         # 第三优先级：对话阶段判断
@@ -499,38 +492,9 @@ class ModelRouter:
         else:
             return False, f"默认Sonnet(msg={user_msg_count},tools={tool_calls})"
 
-    async def route(self, request_body: dict) -> tuple[str, str]:
+    def route(self, request_body: dict) -> tuple[str, str]:
         """
-        路由到合适的模型（线程安全版本）
-
-        Returns:
-            (routed_model, reason)
-        """
-        original_model = request_body.get("model", "")
-
-        # 只处理 Opus 请求
-        if "opus" not in original_model.lower():
-            async with self._lock:
-                self.stats["other"] += 1
-            return original_model, "非Opus请求"
-
-        should_opus, reason = self.should_use_opus(request_body)
-
-        async with self._lock:
-            if should_opus:
-                self.stats["opus"] += 1
-            else:
-                self.stats["sonnet"] += 1
-
-        if should_opus:
-            return self.config.get("opus_model", "claude-opus-4-5-20251101"), reason
-        else:
-            return self.config.get("sonnet_model", "claude-sonnet-4-5-20250929"), reason
-
-    def route_sync(self, request_body: dict) -> tuple[str, str]:
-        """
-        路由到合适的模型（同步版本，用于非异步上下文）
-        注意：统计数据在高并发下可能不精确
+        路由到合适的模型
 
         Returns:
             (routed_model, reason)
@@ -706,15 +670,11 @@ def extract_user_content(messages: list[dict]) -> str:
     return ""
 
 
-# 摘要生成模型配置
-SUMMARY_MODEL = os.getenv("SUMMARY_MODEL", "claude-haiku-4-5-20251001")
-
-
 async def call_kiro_for_summary(prompt: str) -> str:
     """调用 Kiro API 生成摘要 - 使用全局 HTTP 客户端"""
     summary_id = uuid.uuid4().hex[:8]
     request_body = {
-        "model": SUMMARY_MODEL,  # 使用 Haiku 4.5 快速模型
+        "model": "claude-haiku-4",  # 使用快速模型
         "messages": [{"role": "user", "content": prompt}],
         "stream": False,
         "max_tokens": 2000,
@@ -748,61 +708,26 @@ async def call_kiro_for_summary(prompt: str) -> str:
 
 # ==================== Token 计数 ====================
 
-# Token 估算缓存 - 避免对相同文本重复计算
-# 使用文本哈希作为缓存键，避免存储大量文本
-@lru_cache(maxsize=2048)
-def _estimate_tokens_cached(text_hash: int, text_len: int, chinese_ratio_pct: int) -> int:
-    """基于文本特征的 token 估算（带缓存）
+def estimate_tokens(text: str) -> int:
+    """估算文本的 token 数量
 
-    Args:
-        text_hash: 文本的哈希值
-        text_len: 文本长度
-        chinese_ratio_pct: 中文字符占比（0-100）
-
-    Returns:
-        估算的 token 数量
+    简单估算规则：
+    - 英文/代码：约 4 个字符 = 1 token
+    - 中文：约 1.5 个字符 = 1 token
+    - 混合计算取平均
     """
-    chinese_chars = int(text_len * chinese_ratio_pct / 100)
-    other_chars = text_len - chinese_chars
+    if not text:
+        return 0
+
+    # 统计中文字符数
+    chinese_chars = sum(1 for c in text if '\u4e00' <= c <= '\u9fff')
+    other_chars = len(text) - chinese_chars
 
     # 中文约 1.5 字符/token，其他约 4 字符/token
     chinese_tokens = chinese_chars / 1.5
     other_tokens = other_chars / 4
 
     return int(chinese_tokens + other_tokens)
-
-
-def estimate_tokens(text: str) -> int:
-    """估算文本的 token 数量（优化版，带缓存）
-
-    简单估算规则：
-    - 英文/代码：约 4 个字符 = 1 token
-    - 中文：约 1.5 个字符 = 1 token
-    - 混合计算取平均
-
-    优化：
-    - 使用 LRU 缓存避免重复计算
-    - 对于短文本直接计算，避免缓存开销
-    """
-    if not text:
-        return 0
-
-    text_len = len(text)
-
-    # 短文本直接计算，避免缓存开销
-    if text_len < 100:
-        chinese_chars = sum(1 for c in text if '\u4e00' <= c <= '\u9fff')
-        other_chars = text_len - chinese_chars
-        return int(chinese_chars / 1.5 + other_chars / 4)
-
-    # 统计中文字符数并计算占比
-    chinese_chars = sum(1 for c in text if '\u4e00' <= c <= '\u9fff')
-    chinese_ratio_pct = int(chinese_chars * 100 / text_len) if text_len > 0 else 0
-
-    # 使用文本哈希作为缓存键
-    text_hash = hash(text)
-
-    return _estimate_tokens_cached(text_hash, text_len, chinese_ratio_pct)
 
 
 def estimate_messages_tokens(messages: list, system: str = "") -> int:
@@ -1116,17 +1041,17 @@ def clean_system_content(content: str) -> str:
 
 
 def clean_assistant_content(content: str) -> str:
-    """清理 assistant 消息内容（优化版）
+    """清理 assistant 消息内容
 
     移除格式化标记：
     - (no content)
     - [Calling tool: xxx]
     - <thinking>...</thinking> 标签（Kiro API 不支持）
-
-    优化：使用预编译的正则表达式
     """
     if not content:
         return content
+
+    import re
 
     # 移除 (no content) 标记
     content = content.replace("(no content)", "").strip()
@@ -1134,18 +1059,18 @@ def clean_assistant_content(content: str) -> str:
     # 不再移除 [Calling tool: xxx] 标记，因为我们使用这个格式来内联工具调用
 
     # 移除 <thinking>...</thinking> 标签（Kiro API 不支持）
-    # 保留标签内的内容，但移除标签本身（使用预编译正则）
-    content = _RE_THINKING_TAG.sub(r'\1', content)
+    # 保留标签内的内容，但移除标签本身
+    content = re.sub(r'<thinking>(.*?)</thinking>', r'\1', content, flags=re.DOTALL)
 
-    # 移除未闭合的 <thinking> 标签（使用预编译正则）
-    content = _RE_THINKING_UNCLOSED.sub('', content)
-    content = _RE_THINKING_UNOPEN.sub('', content)
+    # 移除未闭合的 <thinking> 标签
+    content = re.sub(r'<thinking>.*$', '', content, flags=re.DOTALL)
+    content = re.sub(r'^.*</thinking>', '', content, flags=re.DOTALL)
 
-    # 移除 <redacted_thinking> 相关标签（使用预编译正则）
-    content = _RE_REDACTED_THINKING.sub('', content)
+    # 移除 <redacted_thinking> 相关标签
+    content = re.sub(r'<redacted_thinking>.*?</redacted_thinking>', '', content, flags=re.DOTALL)
 
-    # 移除其他可能的 Claude 特有标签（使用预编译正则）
-    content = _RE_SIGNATURE_TAG.sub('', content)
+    # 移除其他可能的 Claude 特有标签
+    content = re.sub(r'<signature>.*?</signature>', '', content, flags=re.DOTALL)
 
     return content.strip() if content.strip() else " "
 
@@ -1499,7 +1424,7 @@ def escape_json_string_newlines(json_str: str) -> str:
 
 
 def _try_parse_json(json_str: str, end_pos: int) -> tuple[dict, int]:
-    """尝试多种方式解析 JSON 字符串（优化版）
+    """尝试多种方式解析 JSON 字符串
 
     Args:
         json_str: JSON 字符串
@@ -1507,31 +1432,19 @@ def _try_parse_json(json_str: str, end_pos: int) -> tuple[dict, int]:
 
     Returns:
         (parsed_json, end_position) 或抛出异常
-
-    优化：
-    - 快速路径：直接解析成功则立即返回
-    - 使用预编译的正则表达式
-    - 减少不必要的字符串操作
     """
-    # 快速路径：直接解析
+    import re
+
+    # 直接解析
     try:
         return json.loads(json_str), end_pos
     except json.JSONDecodeError:
         pass
 
-    # 进入修复路径
-    return _try_repair_json(json_str, end_pos)
-
-
-def _try_repair_json(json_str: str, end_pos: int) -> tuple[dict, int]:
-    """尝试修复并解析 JSON 字符串
-
-    仅在直接解析失败时调用，避免不必要的修复尝试
-    """
-    # 修复策略 1: 移除尾随逗号（使用预编译正则）
+    # 修复策略 1: 移除尾随逗号
     try:
-        fixed = _RE_TRAILING_COMMA_OBJ.sub('}', json_str)
-        fixed = _RE_TRAILING_COMMA_ARR.sub(']', fixed)
+        fixed = re.sub(r',\s*}', '}', json_str)
+        fixed = re.sub(r',\s*]', ']', fixed)
         return json.loads(fixed), end_pos
     except json.JSONDecodeError:
         pass
@@ -1546,19 +1459,23 @@ def _try_repair_json(json_str: str, end_pos: int) -> tuple[dict, int]:
     # 修复策略 3: 组合修复
     try:
         fixed = escape_json_string_newlines(json_str)
-        fixed = _RE_TRAILING_COMMA_OBJ.sub('}', fixed)
-        fixed = _RE_TRAILING_COMMA_ARR.sub(']', fixed)
+        fixed = re.sub(r',\s*}', '}', fixed)
+        fixed = re.sub(r',\s*]', ']', fixed)
         return json.loads(fixed), end_pos
     except json.JSONDecodeError:
         pass
 
     # 修复策略 4: 处理截断的字符串值
+    # 如果 JSON 在字符串中间被截断，尝试闭合
     try:
+        # 检查未闭合的引号
         quote_count = json_str.count('"') - json_str.count('\\"')
         if quote_count % 2 == 1:
+            # 奇数个引号，尝试闭合
             fixed = json_str.rstrip()
             if not fixed.endswith('"'):
                 fixed = fixed + '"'
+            # 检查是否需要闭合对象
             open_braces = fixed.count('{') - fixed.count('}')
             if open_braces > 0:
                 fixed = fixed + '}' * open_braces
@@ -1567,7 +1484,9 @@ def _try_repair_json(json_str: str, end_pos: int) -> tuple[dict, int]:
         pass
 
     # 修复策略 5: 提取有效的 JSON 子集
+    # 尝试找到最长的有效 JSON 前缀
     try:
+        # 使用 json.JSONDecoder 来找到有效部分
         decoder = json.JSONDecoder()
         obj, idx = decoder.raw_decode(json_str)
         return obj, end_pos
@@ -1586,16 +1505,16 @@ def extract_json_from_position(text: str, start: int) -> tuple[dict, int]:
 
     Returns:
         (parsed_json, end_position) 或抛出异常
-
-    优化：使用预编译的正则表达式
     """
+    import re
+
     # 跳过空白找到 '{' 或 Markdown 代码块标记
     pos = start
     while pos < len(text) and text[pos] in ' \t\n\r':
         pos += 1
 
-    # 检查是否以 ```json 或 ``` 开头（使用预编译正则）
-    markdown_match = _RE_MARKDOWN_START.match(text[pos:])
+    # 检查是否以 ```json 或 ``` 开头
+    markdown_match = re.match(r'```(?:json)?\s*', text[pos:])
     is_markdown_wrapped = False
     if markdown_match:
         is_markdown_wrapped = True
@@ -1612,7 +1531,7 @@ def extract_json_from_position(text: str, start: int) -> tuple[dict, int]:
     in_string = False
     escape = False
     json_start = pos
-
+    
     while pos < len(text):
         c = text[pos]
 
@@ -1642,15 +1561,15 @@ def extract_json_from_position(text: str, start: int) -> tuple[dict, int]:
             if depth == 0:
                 json_str = text[json_start:pos + 1]
                 parsed_json, _ = _try_parse_json(json_str, pos + 1)
-
-                # 如果是 markdown 包装的，还需要跳过结尾标记（使用预编译正则）
+                
+                # 如果是 markdown 包装的，还需要跳过结尾标记
                 end_pos = pos + 1
                 if is_markdown_wrapped:
                     remaining = text[end_pos:]
-                    end_match = _RE_MARKDOWN_END.search(remaining)
+                    end_match = re.search(r'\s*```', remaining)
                     if end_match:
                         end_pos += end_match.end()
-
+                
                 return parsed_json, end_pos
 
         pos += 1
@@ -1780,17 +1699,17 @@ def tool_calls_to_blocks(tool_calls: list) -> list[dict]:
 
 
 def parse_inline_tool_blocks(text: str) -> list[dict]:
-    """解析内联工具调用，保留文本与工具调用顺序（优化版）
+    """解析内联工具调用，保留文本与工具调用顺序"""
+    import re
 
-    优化：使用预编译的正则表达式
-    """
     blocks = []
+    # 匹配 [Calling tool: name]
+    tool_pattern = r'\[Calling tool:\s*([^\]]+)\]'
     last_end = 0
     pos = 0
 
     while pos < len(text):
-        # 使用预编译正则匹配 [Calling tool: name]
-        match = _RE_TOOL_CALL.search(text[pos:])
+        match = re.search(tool_pattern, text[pos:])
         if not match:
             break
 
@@ -1804,9 +1723,10 @@ def parse_inline_tool_blocks(text: str) -> list[dict]:
 
         tool_name = match.group(1).strip()
         after_match = text[match_end:]
-
-        # 查找 Input: 标记（使用预编译正则）
-        input_match = _RE_INPUT_PREFIX.match(after_match)
+        
+        # 查找 Input: 标记
+        input_pattern = r'^[\s]*Input:\s*'
+        input_match = re.match(input_pattern, after_match)
 
         if input_match:
             json_start_pos = match_end + input_match.end()
@@ -1824,15 +1744,15 @@ def parse_inline_tool_blocks(text: str) -> list[dict]:
                 continue
             except Exception as e:
                 logger.warning(f"JSON parse failed for tool {tool_name} at pos {json_start_pos}: {e}")
-
+                
                 # 备选方案：如果 extract_json_from_position 失败，尝试定位下一个标记并提取中间文本
-                # 标记包括：下一个工具调用、工具结果、或者文本结尾（使用预编译正则）
-                next_marker = _RE_NEXT_MARKER.search(after_match[input_match.end():])
+                # 标记包括：下一个工具调用、工具结果、或者文本结尾
+                next_marker = re.search(r'\[Calling tool:|\[Tool Result\]|\[Tool Error\]', after_match[input_match.end():])
                 if next_marker:
                     raw_text = after_match[input_match.end():input_match.end() + next_marker.start()].strip()
                 else:
                     raw_text = after_match[input_match.end():].strip()
-
+                
                 # 尝试再次解析这个片段
                 try:
                     input_json, _ = _try_parse_json(raw_text, 0)
@@ -1964,71 +1884,21 @@ def detect_truncation(full_text: str, stream_completed: bool, finish_reason: str
     return info
 
 
-# 续传请求验证配置
-CONTINUATION_VALIDATION = {
-    # 最小有效文本长度（低于此值不进行续传）
-    "min_text_length": 10,
-    # 最大连续失败次数（超过后停止续传）
-    "max_consecutive_failures": 3,
-    # 空响应时的降级策略
-    "empty_response_action": "skip",  # skip | retry_with_lower_tokens | error
-}
-
-
-def validate_continuation_text(truncated_text: str, request_id: str) -> tuple[bool, str]:
-    """验证截断文本是否有效，决定是否应该续传
-
-    Returns:
-        (is_valid, reason)
-    """
-    config = CONTINUATION_VALIDATION
-    min_length = config.get("min_text_length", 10)
-
-    # 检查是否为空或过短
-    if not truncated_text:
-        return False, "截断文本为空"
-
-    stripped_text = truncated_text.strip()
-    if len(stripped_text) < min_length:
-        return False, f"截断文本过短 ({len(stripped_text)} < {min_length})"
-
-    # 检查是否只包含错误信息
-    error_markers = ["[上游服务错误]", "[Tool Error]", "Error:", "error:"]
-    for marker in error_markers:
-        if stripped_text.startswith(marker):
-            return False, f"截断文本是错误信息: {marker}"
-
-    return True, "有效"
-
-
 def build_continuation_request(
     original_messages: list,
     truncated_text: str,
     original_body: dict,
     continuation_count: int,
     request_id: str
-) -> tuple[dict | None, bool, str]:
-    """构建续传请求（增强版，带验证）
+) -> dict:
+    """构建续传请求
 
     策略：
-    1. 验证截断文本是否有效
-    2. 保留原始消息历史
-    3. 添加截断的 assistant 响应
-    4. 添加续传提示作为新的 user 消息
-
-    Returns:
-        (request_body, should_continue, reason)
-        - request_body: 续传请求体，如果不应续传则为 None
-        - should_continue: 是否应该继续续传
-        - reason: 决策原因
+    1. 保留原始消息历史
+    2. 添加截断的 assistant 响应
+    3. 添加续传提示作为新的 user 消息
     """
     config = CONTINUATION_CONFIG
-
-    # ==================== 关键修复：验证截断文本 ====================
-    is_valid, validation_reason = validate_continuation_text(truncated_text, request_id)
-    if not is_valid:
-        logger.warning(f"[{request_id}] 续传验证失败: {validation_reason}，停止续传")
-        return None, False, validation_reason
 
     # 获取截断结尾（用于续传提示）
     ending_chars = config.get("truncated_ending_chars", 500)
@@ -2063,30 +1933,36 @@ def build_continuation_request(
 
     logger.info(f"[{request_id}] 构建续传请求 #{continuation_count + 1}: "
                 f"原始消息={len(original_messages)}, 新消息={len(new_messages)}, "
-                f"截断文本长度={len(truncated_text)}, 截断结尾预览={truncated_ending[:100]}...")
+                f"截断文本长度={len(truncated_text)}")
 
-    return new_body, True, "验证通过"
+    return new_body
 
 
 def merge_responses(original_text: str, continuation_text: str, request_id: str) -> str:
-    """合并原始响应和续传响应，增强 JSON 边界处理（优化版）
+    """合并原始响应和续传响应，增强 JSON 边界处理
 
     策略：
     1. 检测续传响应是否有重复内容
     2. 智能拼接，特别处理 JSON 截断点
     3. 修复可能出现的转义冲突
-
-    优化：使用预编译的正则表达式
     """
     if not continuation_text:
         return original_text
 
     # 清理续传响应开头可能的重复内容或提示
     continuation_clean = continuation_text.lstrip()
-
-    # 移除模型可能添加的续传引导词（使用预编译正则）
-    for pattern in _RE_CONTINUATION_INTRO:
-        match = pattern.match(continuation_clean)
+    
+    # 移除模型可能添加的续传引导词，如 "Continuing from where I left off:"
+    intro_patterns = [
+        r"^Continuing from.*?:",
+        r"^Here is the rest of the response:",
+        r"^Continuing the JSON:",
+        r"^```json\s*",
+        r"^```\s*"
+    ]
+    import re
+    for pattern in intro_patterns:
+        match = re.match(pattern, continuation_clean, re.IGNORECASE | re.DOTALL)
         if match:
             continuation_clean = continuation_clean[match.end():].lstrip()
 
@@ -2133,7 +2009,6 @@ async def fetch_with_continuation(
 
     accumulated_text = ""
     continuation_count = 0
-    consecutive_failures = 0  # 连续失败计数（用于智能停止）
     final_finish_reason = "end_turn"
     final_stream_completed = False
     total_input_tokens = 0
@@ -2162,31 +2037,12 @@ async def fetch_with_continuation(
         if tool_calls:
             aggregated_tool_calls.extend(tool_calls)
 
-        # ==================== 增强错误处理 ====================
         # 关键：如果上游返回错误，不要续传
         if finish_reason in ("error", "timeout"):
             logger.warning(f"[{request_id}] 上游返回错误 ({finish_reason})，停止续传")
             final_finish_reason = "end_turn"  # 返回 end_turn 避免触发 CLI 错误
             final_stream_completed = True
             break
-
-        # 检测本次请求是否获得了有效内容
-        current_text_len = len(text.strip()) if text else 0
-        if current_text_len == 0 and continuation_count > 0:
-            # 续传请求返回空内容，增加失败计数
-            consecutive_failures += 1
-            logger.warning(f"[{request_id}] 续传请求 #{continuation_count} 返回空内容，连续失败={consecutive_failures}")
-
-            # 检查是否超过最大连续失败次数
-            max_failures = CONTINUATION_VALIDATION.get("max_consecutive_failures", 3)
-            if consecutive_failures >= max_failures:
-                logger.error(f"[{request_id}] 连续 {consecutive_failures} 次续传失败，停止续传")
-                final_finish_reason = "end_turn"
-                final_stream_completed = True
-                break
-        else:
-            # 获得了有效内容，重置失败计数
-            consecutive_failures = 0
 
         # 检测是否需要续传
         truncation_info = detect_truncation(accumulated_text, stream_completed, finish_reason, request_id)
@@ -2198,11 +2054,10 @@ async def fetch_with_continuation(
             logger.info(f"[{request_id}] 请求完成: 无截断, 总续传次数={continuation_count}")
             break
 
-        # ==================== 智能续传决策 ====================
+        # 检查是否应该续传
         should_continue = False
         triggers = config.get("triggers", {})
 
-        # 基于触发条件判断
         if truncation_info.reason == "stream_interrupted" and triggers.get("stream_interrupted", True):
             should_continue = True
         elif truncation_info.reason == "max_tokens_reached" and triggers.get("max_tokens_reached", True):
@@ -2212,15 +2067,8 @@ async def fetch_with_continuation(
         elif "tool_parse_error" in str(truncation_info.reason) and triggers.get("parse_error", True):
             should_continue = True
 
-        # 额外检查：如果累积文本为空或过短，不应续传
-        accumulated_len = len(accumulated_text.strip()) if accumulated_text else 0
-        min_text_for_continuation = CONTINUATION_VALIDATION.get("min_text_length", 10)
-        if accumulated_len < min_text_for_continuation:
-            logger.warning(f"[{request_id}] 累积文本过短 ({accumulated_len} < {min_text_for_continuation})，停止续传")
-            should_continue = False
-
         if not should_continue:
-            logger.info(f"[{request_id}] 截断但不续传: reason={truncation_info.reason}, accumulated_len={accumulated_len}")
+            logger.info(f"[{request_id}] 截断但不续传: reason={truncation_info.reason}, triggers={triggers}")
             final_finish_reason = finish_reason
             final_stream_completed = stream_completed
             break
@@ -2231,59 +2079,21 @@ async def fetch_with_continuation(
             final_stream_completed = False
             break
 
-        # ==================== 关键修复：构建续传请求（带验证） ====================
+        # 构建续传请求
         logger.info(f"[{request_id}] 触发续传 #{continuation_count + 1}: reason={truncation_info.reason}")
-
-        # 使用新的验证版本构建续传请求
-        continuation_result = build_continuation_request(
+        current_body = build_continuation_request(
             original_messages,
             accumulated_text,
             openai_body,
             continuation_count,
             request_id
         )
-
-        # 检查返回值类型（兼容新旧版本）
-        if isinstance(continuation_result, tuple):
-            # 新版本：返回 (body, should_continue, reason)
-            new_body, should_build, build_reason = continuation_result
-            if not should_build or new_body is None:
-                logger.warning(f"[{request_id}] 续传请求构建失败: {build_reason}，停止续传")
-                final_finish_reason = "end_turn"
-                final_stream_completed = True
-                break
-            current_body = new_body
-        else:
-            # 旧版本兼容：直接返回 body
-            current_body = continuation_result
-
         continuation_count += 1
-
-    # ==================== 完成日志和降级处理 ====================
-    final_text_len = len(accumulated_text.strip()) if accumulated_text else 0
-    final_tool_count = len(aggregated_tool_calls)
-
-    # 判断是否需要降级处理
-    if final_text_len == 0 and final_tool_count == 0 and continuation_count > 0:
-        # 多次续传后仍然没有有效内容，记录详细警告
-        logger.error(f"[{request_id}] ⚠️ 续传失败: {continuation_count} 次续传后无有效内容")
-        # 降级策略：返回友好的错误提示而不是空响应
-        accumulated_text = "[系统提示] 请求处理遇到问题，请稍后重试或简化您的请求。"
-        final_finish_reason = "end_turn"
-        final_stream_completed = True
-    elif continuation_count > 0:
-        logger.info(f"[{request_id}] 🔄 接续完成: {continuation_count} 次续传, "
-                    f"最终文本长度={final_text_len}, 工具调用={final_tool_count}")
-    else:
-        logger.info(f"[{request_id}] ✅ 请求完成: 无需续传, "
-                    f"文本长度={final_text_len}, 工具调用={final_tool_count}")
 
     return accumulated_text, final_finish_reason, final_stream_completed, {
         "input_tokens": total_input_tokens,
         "output_tokens": total_output_tokens,
-        "continuation_count": continuation_count,
-        "consecutive_failures": consecutive_failures,
-        "final_text_length": final_text_len,
+        "continuation_count": continuation_count
     }, aggregated_tool_calls
 
 
@@ -2316,58 +2126,15 @@ async def _fetch_single_stream(
             if response.status_code != 200:
                 error_text = await response.aread()
                 error_str = error_text.decode()
-
-                # ==================== 增强错误分类和日志 ====================
-                error_msg = error_str[:500]
-                error_type = "unknown"
-                is_retryable = False
-
+                logger.error(f"[{request_id}] 续传请求 #{continuation_count} 失败: {response.status_code} - {error_str[:200]}")
+                # 解析错误信息并返回给客户端
                 try:
                     error_json = json.loads(error_str)
-                    error_msg = error_json.get("error", {}).get("message", error_str[:500])
-                    # error_code 和 error_param 可用于未来扩展
-                    # error_code = error_json.get("error", {}).get("code")
-                    # error_param = error_json.get("error", {}).get("param")
-
-                    # 分类错误类型
-                    if "Improperly formed request" in error_msg:
-                        error_type = "malformed_request"
-                        is_retryable = False
-                        logger.error(f"[{request_id}] ❌ 请求格式错误 (续传 #{continuation_count}): {error_msg[:200]}")
-                    elif "token" in error_msg.lower() or "没有可用" in error_msg:
-                        error_type = "token_exhausted"
-                        is_retryable = False
-                        logger.error(f"[{request_id}] ❌ Token 耗尽 (续传 #{continuation_count}): {error_msg[:200]}")
-                    elif "rate limit" in error_msg.lower() or "too many" in error_msg.lower():
-                        error_type = "rate_limit"
-                        is_retryable = True
-                        logger.warning(f"[{request_id}] ⚠️ 速率限制 (续传 #{continuation_count}): {error_msg[:200]}")
-                    elif "timeout" in error_msg.lower():
-                        error_type = "timeout"
-                        is_retryable = True
-                        logger.warning(f"[{request_id}] ⚠️ 超时 (续传 #{continuation_count}): {error_msg[:200]}")
-                    elif response.status_code == 400:
-                        error_type = "bad_request"
-                        is_retryable = False
-                        logger.error(f"[{request_id}] ❌ 错误请求 (续传 #{continuation_count}): {error_msg[:200]}")
-                    elif response.status_code >= 500:
-                        error_type = "server_error"
-                        is_retryable = True
-                        logger.warning(f"[{request_id}] ⚠️ 服务器错误 (续传 #{continuation_count}): {error_msg[:200]}")
-                    else:
-                        logger.error(f"[{request_id}] ❌ 未知错误 (续传 #{continuation_count}): status={response.status_code}, msg={error_msg[:200]}")
-
-                except json.JSONDecodeError:
-                    logger.error(f"[{request_id}] ❌ 无法解析错误响应 (续传 #{continuation_count}): {error_str[:200]}")
-
-                # 返回错误信息，包含错误类型以便上层决策
-                return f"[上游服务错误] {error_msg}", "error", True, {
-                    "input_tokens": 0,
-                    "output_tokens": 0,
-                    "error_type": error_type,
-                    "is_retryable": is_retryable,
-                    "status_code": response.status_code,
-                }, []
+                    error_msg = error_json.get("error", {}).get("message", error_str[:200])
+                except:
+                    error_msg = error_str[:200]
+                # 返回错误信息作为文本，让客户端能看到
+                return f"[上游服务错误] {error_msg}", "error", True, {"input_tokens": 0, "output_tokens": 0}, []
 
             buffer = ""
             try:
@@ -2518,6 +2285,112 @@ def convert_openai_to_anthropic(openai_response: dict, model: str, request_id: s
     }
 
 
+def convert_anthropic_to_openai_simple(anthropic_body: dict) -> dict:
+    """最简单的 Anthropic -> OpenAI 转换，带截断保护"""
+
+    # 截断配置
+    MAX_MESSAGES = 20          # 最大消息数（不含 system）
+    MAX_TOTAL_CHARS = 80000    # 最大总字符数
+    MAX_SINGLE_CONTENT = 30000 # 单条消息最大字符数
+
+    messages = []
+
+    # 处理 system 消息
+    system = anthropic_body.get("system", "")
+    if system:
+        if isinstance(system, str):
+            system_content = system
+        elif isinstance(system, list):
+            parts = []
+            for item in system:
+                if isinstance(item, dict) and "text" in item:
+                    parts.append(item["text"])
+                elif isinstance(item, str):
+                    parts.append(item)
+            system_content = "\n".join(parts)
+        else:
+            system_content = str(system)
+
+        if system_content.strip():
+            # 截断过长的 system 消息
+            if len(system_content) > MAX_SINGLE_CONTENT:
+                system_content = system_content[:MAX_SINGLE_CONTENT] + "\n...[truncated]"
+            messages.append({"role": "system", "content": system_content})
+
+    # 转换 messages
+    raw_messages = anthropic_body.get("messages", [])
+
+    # 如果消息太多，只保留最近的
+    if len(raw_messages) > MAX_MESSAGES:
+        raw_messages = raw_messages[-MAX_MESSAGES:]
+
+    for msg in raw_messages:
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+
+        # 处理 content
+        if isinstance(content, list):
+            text_parts = []
+            for item in content:
+                if isinstance(item, dict):
+                    if item.get("type") == "text":
+                        text_parts.append(item.get("text", ""))
+                    elif item.get("type") == "tool_result":
+                        result_content = item.get("content", "")
+                        if isinstance(result_content, str):
+                            text_parts.append(result_content)
+                        elif isinstance(result_content, list):
+                            for rc in result_content:
+                                if isinstance(rc, dict) and rc.get("type") == "text":
+                                    text_parts.append(rc.get("text", ""))
+                elif isinstance(item, str):
+                    text_parts.append(item)
+            content = "\n".join(filter(None, text_parts))
+
+        # 确保 content 非空
+        if not content or not content.strip():
+            content = " "
+
+        # 截断过长的单条消息
+        if len(content) > MAX_SINGLE_CONTENT:
+            content = content[:MAX_SINGLE_CONTENT] + "\n...[truncated]"
+
+        messages.append({"role": role, "content": content})
+
+    # 确保至少有一条消息
+    if not messages:
+        messages.append({"role": "user", "content": "Hello"})
+
+    # 检查总字符数，如果超过则进一步截断
+    total_chars = sum(len(m.get("content", "")) for m in messages)
+    while total_chars > MAX_TOTAL_CHARS and len(messages) > 2:
+        # 保留 system（如果有）和最后一条消息，删除最早的非 system 消息
+        if messages[0].get("role") == "system":
+            if len(messages) > 2:
+                messages.pop(1)
+        else:
+            messages.pop(0)
+        total_chars = sum(len(m.get("content", "")) for m in messages)
+
+    # 构建 OpenAI 请求
+    openai_body = {
+        "model": anthropic_body.get("model", "claude-sonnet-4"),
+        "messages": messages,
+        "stream": anthropic_body.get("stream", False),
+    }
+
+    # 流式响应时，请求包含 usage 信息
+    if anthropic_body.get("stream", False):
+        openai_body["stream_options"] = {"include_usage": True}
+
+    if "max_tokens" in anthropic_body:
+        openai_body["max_tokens"] = anthropic_body["max_tokens"]
+    if "temperature" in anthropic_body:
+        openai_body["temperature"] = anthropic_body["temperature"]
+
+    return openai_body
+
+
 @app.post("/v1/messages")
 async def anthropic_messages(request: Request):
     """Anthropic /v1/messages 端点 - 通过 OpenAI 格式发送到 tokens 网关"""
@@ -2550,7 +2423,7 @@ async def anthropic_messages(request: Request):
 
     # ==================== 智能模型路由 ====================
     # 对 Opus 请求进行智能降级判断
-    routed_model, route_reason = await model_router.route(body)
+    routed_model, route_reason = model_router.route(body)
 
     if routed_model != original_model:
         logger.info(f"[{request_id}] 🔀 模型路由: {original_model} -> {routed_model} ({route_reason})")
@@ -2561,39 +2434,6 @@ async def anthropic_messages(request: Request):
         model = original_model
         if "opus" in original_model.lower():
             logger.info(f"[{request_id}] ✅ 保留 Opus: {route_reason}")
-
-    # ==================== 历史消息管理 ====================
-    # 创建历史管理器（与 /v1/chat/completions 保持一致）
-    session_id = generate_session_id(body.get("messages", []))
-    manager = HistoryManager(HISTORY_CONFIG, cache_key=session_id)
-
-    # 预处理消息（截断/摘要）
-    messages = body.get("messages", [])
-    user_content = extract_user_content(messages)
-
-    # 计算原始消息大小
-    original_chars = len(json.dumps(messages, ensure_ascii=False))
-    logger.info(f"[{request_id}] 原始消息: {len(messages)} 条, {original_chars} 字符")
-
-    # 检查是否需要截断/摘要
-    should_summarize = manager.should_summarize(messages)
-    logger.info(f"[{request_id}] 需要摘要: {should_summarize}, 阈值: {HISTORY_CONFIG.summary_threshold}")
-
-    if should_summarize:
-        logger.info(f"[{request_id}] 触发智能摘要...")
-        processed_messages = await manager.pre_process_async(
-            messages, user_content, call_kiro_for_summary
-        )
-    else:
-        processed_messages = manager.pre_process(messages, user_content)
-
-    if manager.was_truncated:
-        logger.info(f"[{request_id}] ✂️ {manager.truncate_info}")
-    else:
-        logger.info(f"[{request_id}] 无需截断")
-
-    # 更新 body 中的 messages
-    body["messages"] = processed_messages
 
     # 使用完整转换（包含截断和空消息过滤）
     openai_body = convert_anthropic_to_openai(body)
@@ -2606,28 +2446,21 @@ async def anthropic_messages(request: Request):
 
     # 保存调试文件（仅保留最近几个）
     debug_dir = "/tmp/ai-history-debug"
+    import os
     os.makedirs(debug_dir, exist_ok=True)
     try:
         with open(f"{debug_dir}/{request_id}_converted.json", "w") as f:
             json.dump(openai_body, f, indent=2, ensure_ascii=False)
-        # 清理旧文件（保留最近 10 个）- 处理并发删除的竞态条件
-        try:
-            debug_files = sorted(
-                [f for f in os.listdir(debug_dir) if f.endswith('.json')],
-                key=lambda x: os.path.getmtime(os.path.join(debug_dir, x)),
-                reverse=True
-            )
-            for old_file in debug_files[10:]:
-                try:
-                    os.remove(os.path.join(debug_dir, old_file))
-                except FileNotFoundError:
-                    pass  # 已被其他请求删除
-                except OSError:
-                    pass  # 其他文件系统错误
-        except OSError:
-            pass  # 目录列表失败
-    except Exception:
-        pass  # 非关键操作，忽略所有错误
+        # 清理旧文件（保留最近 10 个）
+        debug_files = sorted(
+            [f for f in os.listdir(debug_dir) if f.endswith('.json')],
+            key=lambda x: os.path.getmtime(os.path.join(debug_dir, x)),
+            reverse=True
+        )
+        for old_file in debug_files[10:]:
+            os.remove(os.path.join(debug_dir, old_file))
+    except:
+        pass
 
     # 构建请求头 - 添加唯一标识让 tokens 区分不同请求
     # 关键：每个请求使用不同的 X-Request-ID 和 X-Trace-ID
