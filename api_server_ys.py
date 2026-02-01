@@ -30,15 +30,21 @@ from pydantic import BaseModel
 
 from ai_history_manager import HistoryManager, HistoryConfig, TruncateStrategy
 from ai_history_manager.utils import is_content_length_error
+from kiro_converter import convert_anthropic_to_kiro, convert_kiro_to_anthropic
 
 # ==================== 配置 ====================
 
 # Kiro 代理地址 (tokens 网关, 使用内网地址)
 KIRO_PROXY_BASE = "http://127.0.0.1:8000"
-# OpenAI 兼容端点 (Kiro 渠道)
+# OpenAI 兼容端点 (Kiro 渠道) - 保留用于兼容
 KIRO_PROXY_URL = f"{KIRO_PROXY_BASE}/kiro/v1/chat/completions"
+# Kiro 原生端点 (推荐，支持原生工具调用)
+KIRO_NATIVE_URL = f"{KIRO_PROXY_BASE}/kiro/v1/converse"
 KIRO_MODELS_URL = f"{KIRO_PROXY_BASE}/kiro/v1/models"
 KIRO_API_KEY = "dba22273-65d3-4dc1-8ce9-182f680b2bf5"
+
+# 是否使用 Kiro 原生格式（推荐开启，支持工具调用）
+USE_KIRO_NATIVE = os.getenv("USE_KIRO_NATIVE", "true").lower() in ("1", "true", "yes")
 
 # ==================== 智能接续配置 ====================
 
@@ -266,12 +272,6 @@ _RE_CONTINUATION_INTRO = [
 
 # 用于检测下一个标记
 _RE_NEXT_MARKER = re.compile(r'\[Calling tool:|\[Tool Result\]|\[Tool Error\]')
-
-# 用于解析 XML 格式的工具调用 (Kiro 返回格式)
-# 匹配 <ToolName>...</ToolName> 格式，工具名以大写字母开头
-_RE_XML_TOOL_CALL = re.compile(r'<([A-Z][a-zA-Z0-9_]*)>([\s\S]*?)</\1>')
-# 匹配 XML 参数 <param_name>value</param_name>
-_RE_XML_PARAM = re.compile(r'<([a-z_][a-z0-9_]*)>([\s\S]*?)</\1>', re.IGNORECASE)
 
 # 用于文件路径匹配
 _RE_FILE_PATH = re.compile(r'[/\\][\w\-\.]+\.(py|js|ts|jsx|tsx|go|rs|java|cpp|c|h|md|yaml|yml|json|toml)')
@@ -1785,67 +1785,6 @@ def tool_calls_to_blocks(tool_calls: list) -> list[dict]:
     return blocks
 
 
-def parse_xml_tool_params(xml_content: str) -> dict:
-    """解析 XML 格式的工具参数
-
-    例如: <path>/etc/hostname</path> -> {"path": "/etc/hostname"}
-    """
-    params = {}
-    for match in _RE_XML_PARAM.finditer(xml_content):
-        param_name = match.group(1)
-        param_value = match.group(2).strip()
-        # 尝试解析 JSON 值（支持嵌套对象）
-        try:
-            params[param_name] = json.loads(param_value)
-        except (json.JSONDecodeError, ValueError):
-            params[param_name] = param_value
-    return params
-
-
-def parse_xml_tool_blocks(text: str) -> list[dict]:
-    """解析 XML 格式的工具调用（Kiro 返回格式）
-
-    检测格式:
-    <ToolName>
-    <param1>value1</param1>
-    <param2>value2</param2>
-    </ToolName>
-
-    返回保持顺序的 blocks 列表，包含 text 和 tool_use 类型
-    """
-    blocks = []
-    last_end = 0
-
-    for match in _RE_XML_TOOL_CALL.finditer(text):
-        # 提取工具调用前的文本
-        before_text = text[last_end:match.start()]
-        if before_text and before_text.strip():
-            blocks.append({"type": "text", "text": before_text})
-
-        tool_name = match.group(1)
-        xml_content = match.group(2)
-
-        # 解析 XML 参数
-        params = parse_xml_tool_params(xml_content)
-
-        blocks.append({
-            "type": "tool_use",
-            "id": f"toolu_{uuid.uuid4().hex[:12]}",
-            "name": tool_name,
-            "input": params,
-        })
-
-        last_end = match.end()
-
-    # 添加剩余文本
-    if last_end < len(text):
-        remaining = text[last_end:]
-        if remaining and remaining.strip():
-            blocks.append({"type": "text", "text": remaining})
-
-    return blocks
-
-
 def parse_inline_tool_blocks(text: str) -> list[dict]:
     """解析内联工具调用，保留文本与工具调用顺序（优化版）
 
@@ -1936,13 +1875,6 @@ def parse_inline_tool_blocks(text: str) -> list[dict]:
         remaining = text[last_end:]
         if remaining and remaining.strip():
             blocks.append({"type": "text", "text": remaining})
-
-    # 如果没有找到 [Calling tool: ...] 格式的工具调用，
-    # 尝试解析 XML 格式的工具调用（Kiro 返回格式）
-    has_tool_use = any(b.get("type") == "tool_use" for b in blocks)
-    if not has_tool_use and _RE_XML_TOOL_CALL.search(text):
-        logger.debug("No [Calling tool:] format found, trying XML format")
-        return parse_xml_tool_blocks(text)
 
     return blocks
 
@@ -2669,55 +2601,86 @@ async def anthropic_messages(request: Request):
     # 更新 body 中的 messages
     body["messages"] = processed_messages
 
-    # 使用完整转换（包含截断和空消息过滤）
-    openai_body = convert_anthropic_to_openai(body)
-
-    final_msg_count = len(openai_body.get("messages", []))
-    total_chars = sum(len(str(m.get("content", ""))) for m in openai_body.get("messages", []))
-
-    logger.info(f"[{request_id}] Anthropic -> OpenAI: model={model}, stream={stream}, "
-                f"msgs={orig_msg_count}->{final_msg_count}, chars={total_chars}, max_tokens={final_max_tokens}")
-
-    # 保存调试文件（仅保留最近几个）
-    debug_dir = "/tmp/ai-history-debug"
-    os.makedirs(debug_dir, exist_ok=True)
-    try:
-        with open(f"{debug_dir}/{request_id}_converted.json", "w") as f:
-            json.dump(openai_body, f, indent=2, ensure_ascii=False)
-        # 清理旧文件（保留最近 10 个）- 处理并发删除的竞态条件
-        try:
-            debug_files = sorted(
-                [f for f in os.listdir(debug_dir) if f.endswith('.json')],
-                key=lambda x: os.path.getmtime(os.path.join(debug_dir, x)),
-                reverse=True
-            )
-            for old_file in debug_files[10:]:
-                try:
-                    os.remove(os.path.join(debug_dir, old_file))
-                except FileNotFoundError:
-                    pass  # 已被其他请求删除
-                except OSError:
-                    pass  # 其他文件系统错误
-        except OSError:
-            pass  # 目录列表失败
-    except Exception:
-        pass  # 非关键操作，忽略所有错误
-
     # 构建请求头 - 添加唯一标识让 tokens 区分不同请求
-    # 关键：每个请求使用不同的 X-Request-ID 和 X-Trace-ID
-    # 这样 tokens 不会把多个请求当作同一终端处理
     headers = {
         "Authorization": f"Bearer {KIRO_API_KEY}",
         "Content-Type": "application/json",
         "X-Request-ID": f"req_{request_id}_{uuid.uuid4().hex[:8]}",
         "X-Trace-ID": f"trace_{uuid.uuid4().hex}",
-        "X-Client-ID": f"client_{uuid.uuid4().hex[:12]}",  # 模拟不同客户端
+        "X-Client-ID": f"client_{uuid.uuid4().hex[:12]}",
     }
 
-    if stream:
-        return await handle_anthropic_stream_via_openai(openai_body, headers, request_id, model)
+    # ==================== 选择转换路径 ====================
+    if USE_KIRO_NATIVE:
+        # 使用 Kiro 原生格式（推荐，支持工具调用）
+        kiro_body = convert_anthropic_to_kiro(body)
+
+        final_msg_count = len(kiro_body.get("messages", []))
+        total_chars = sum(
+            len(json.dumps(m.get("content", ""), ensure_ascii=False))
+            for m in kiro_body.get("messages", [])
+        )
+        tool_count = len(kiro_body.get("tools", []))
+
+        logger.info(f"[{request_id}] Anthropic -> Kiro Native: model={model}, stream={stream}, "
+                    f"msgs={orig_msg_count}->{final_msg_count}, chars={total_chars}, "
+                    f"tools={tool_count}, max_tokens={final_max_tokens}")
+
+        # 保存调试文件
+        debug_dir = "/tmp/ai-history-debug"
+        os.makedirs(debug_dir, exist_ok=True)
+        try:
+            with open(f"{debug_dir}/{request_id}_kiro.json", "w") as f:
+                json.dump(kiro_body, f, indent=2, ensure_ascii=False)
+            _cleanup_debug_files(debug_dir, 10)
+        except Exception:
+            pass
+
+        if stream:
+            return await handle_anthropic_stream_via_kiro(kiro_body, headers, request_id, model)
+        else:
+            return await handle_anthropic_non_stream_via_kiro(kiro_body, headers, request_id, model)
     else:
-        return await handle_anthropic_non_stream_via_openai(openai_body, headers, request_id, model)
+        # 使用 OpenAI 兼容格式（旧路径）
+        openai_body = convert_anthropic_to_openai(body)
+
+        final_msg_count = len(openai_body.get("messages", []))
+        total_chars = sum(len(str(m.get("content", ""))) for m in openai_body.get("messages", []))
+
+        logger.info(f"[{request_id}] Anthropic -> OpenAI: model={model}, stream={stream}, "
+                    f"msgs={orig_msg_count}->{final_msg_count}, chars={total_chars}, max_tokens={final_max_tokens}")
+
+        # 保存调试文件
+        debug_dir = "/tmp/ai-history-debug"
+        os.makedirs(debug_dir, exist_ok=True)
+        try:
+            with open(f"{debug_dir}/{request_id}_converted.json", "w") as f:
+                json.dump(openai_body, f, indent=2, ensure_ascii=False)
+            _cleanup_debug_files(debug_dir, 10)
+        except Exception:
+            pass
+
+        if stream:
+            return await handle_anthropic_stream_via_openai(openai_body, headers, request_id, model)
+        else:
+            return await handle_anthropic_non_stream_via_openai(openai_body, headers, request_id, model)
+
+
+def _cleanup_debug_files(debug_dir: str, keep_count: int):
+    """清理旧调试文件，保留最近 N 个"""
+    try:
+        debug_files = sorted(
+            [f for f in os.listdir(debug_dir) if f.endswith('.json')],
+            key=lambda x: os.path.getmtime(os.path.join(debug_dir, x)),
+            reverse=True
+        )
+        for old_file in debug_files[keep_count:]:
+            try:
+                os.remove(os.path.join(debug_dir, old_file))
+            except (FileNotFoundError, OSError):
+                pass
+    except OSError:
+        pass
 
 
 async def handle_anthropic_stream_via_openai(
@@ -3006,6 +2969,251 @@ async def handle_anthropic_non_stream_via_openai(
                 "error": {"type": "api_error", "message": str(e)}
             }
         )
+
+
+# ==================== Kiro 原生格式处理 ====================
+
+async def handle_anthropic_stream_via_kiro(
+    kiro_body: dict,
+    headers: dict,
+    request_id: str,
+    model: str,
+) -> StreamingResponse:
+    """处理 Anthropic 流式请求 - 通过 Kiro 原生格式
+
+    使用 Kiro /v1/converse 端点，支持原生工具调用
+    """
+
+    # 预估输入 token 数
+    estimated_input_tokens = 0
+    for msg in kiro_body.get("messages", []):
+        content = msg.get("content", [])
+        if isinstance(content, list):
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    estimated_input_tokens += estimate_tokens(item.get("text", ""))
+        estimated_input_tokens += 4
+
+    async def generate() -> AsyncIterator[bytes]:
+        try:
+            # 发送 Anthropic 流式头
+            msg_start = {
+                "type": "message_start",
+                "message": {
+                    "id": f"msg_{request_id}",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                    "model": model,
+                    "stop_reason": None,
+                    "stop_sequence": None,
+                    "usage": {"input_tokens": estimated_input_tokens, "output_tokens": 0}
+                }
+            }
+            yield f"data: {json.dumps(msg_start)}\n\n".encode()
+
+            # 调用 Kiro 原生端点
+            full_text = ""
+            tool_uses = []
+            finish_reason = "end_turn"
+            output_tokens = 0
+            input_tokens = estimated_input_tokens
+
+            client = get_http_client()
+            kiro_body["stream"] = True
+
+            async with client.stream(
+                "POST",
+                KIRO_NATIVE_URL,
+                json=kiro_body,
+                headers=headers,
+                timeout=httpx.Timeout(300.0, connect=30.0),
+            ) as response:
+                if response.status_code != 200:
+                    error_text = await response.aread()
+                    logger.error(f"[{request_id}] Kiro API Error {response.status_code}: {error_text[:500]}")
+                    error_response = {
+                        "type": "error",
+                        "error": {"type": "api_error", "message": f"Kiro API error: {response.status_code}"}
+                    }
+                    yield f"data: {json.dumps(error_response)}\n\n".encode()
+                    return
+
+                # 解析 Kiro SSE 流
+                async for line in response.aiter_lines():
+                    if not line or not line.startswith("data: "):
+                        continue
+
+                    data_str = line[6:]
+                    if data_str == "[DONE]":
+                        break
+
+                    try:
+                        event = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        continue
+
+                    # 处理 Kiro 事件并转换为 Anthropic 格式
+                    anthropic_events = convert_kiro_to_anthropic(event, request_id)
+                    for evt in anthropic_events:
+                        if evt.get("type") == "content_block_delta":
+                            delta = evt.get("delta", {})
+                            if delta.get("type") == "text_delta":
+                                full_text += delta.get("text", "")
+                        elif evt.get("type") == "content_block_start":
+                            block = evt.get("content_block", {})
+                            if block.get("type") == "tool_use":
+                                tool_uses.append(block)
+                        elif evt.get("type") == "message_delta":
+                            delta = evt.get("delta", {})
+                            if delta.get("stop_reason"):
+                                finish_reason = delta["stop_reason"]
+                            usage = evt.get("usage", {})
+                            if usage.get("output_tokens"):
+                                output_tokens = usage["output_tokens"]
+
+                        yield f"data: {json.dumps(evt)}\n\n".encode()
+
+            # 如果没有输出 token 统计，使用估算
+            if output_tokens == 0:
+                output_tokens = estimate_tokens(full_text)
+
+            logger.info(f"[{request_id}] Kiro 流完成: text_len={len(full_text)}, "
+                        f"tools={len(tool_uses)}, finish={finish_reason}")
+
+            # message stop
+            yield f'data: {{"type":"message_stop"}}\n\n'.encode()
+
+        except httpx.TimeoutException:
+            logger.error(f"[{request_id}] Kiro 请求超时")
+            error_response = {
+                "type": "error",
+                "error": {"type": "timeout_error", "message": "Request timeout"}
+            }
+            yield f"data: {json.dumps(error_response)}\n\n".encode()
+        except (httpx.RemoteProtocolError, httpx.ReadError) as e:
+            logger.error(f"[{request_id}] Kiro 连接中断: {type(e).__name__}: {e}")
+            error_response = {
+                "type": "error",
+                "error": {"type": "stream_error", "message": f"Connection interrupted: {type(e).__name__}"}
+            }
+            yield f"data: {json.dumps(error_response)}\n\n".encode()
+        except Exception as e:
+            logger.error(f"[{request_id}] Kiro 请求异常: {type(e).__name__}: {e}")
+            error_response = {
+                "type": "error",
+                "error": {"type": "api_error", "message": str(e)}
+            }
+            yield f"data: {json.dumps(error_response)}\n\n".encode()
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        }
+    )
+
+
+async def handle_anthropic_non_stream_via_kiro(
+    kiro_body: dict,
+    headers: dict,
+    request_id: str,
+    model: str,
+) -> JSONResponse:
+    """处理 Anthropic 非流式请求 - 通过 Kiro 原生格式"""
+    try:
+        client = get_http_client()
+        kiro_body["stream"] = False
+
+        response = await client.post(
+            KIRO_NATIVE_URL,
+            json=kiro_body,
+            headers=headers,
+            timeout=httpx.Timeout(300.0, connect=30.0),
+        )
+
+        if response.status_code != 200:
+            error_str = response.text
+            logger.error(f"[{request_id}] Kiro API Error {response.status_code}: {error_str[:200]}")
+            return JSONResponse(
+                status_code=response.status_code,
+                content={
+                    "type": "error",
+                    "error": {"type": "api_error", "message": error_str[:500]}
+                }
+            )
+
+        # 转换 Kiro 响应为 Anthropic 格式
+        kiro_response = response.json()
+        anthropic_response = convert_kiro_response_to_anthropic(kiro_response, model, request_id)
+        return JSONResponse(content=anthropic_response)
+
+    except httpx.TimeoutException:
+        logger.error(f"[{request_id}] Kiro 请求超时")
+        return JSONResponse(
+            status_code=408,
+            content={
+                "type": "error",
+                "error": {"type": "timeout_error", "message": "Request timeout"}
+            }
+        )
+    except Exception as e:
+        logger.error(f"[{request_id}] Kiro 请求异常: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={
+                "type": "error",
+                "error": {"type": "api_error", "message": str(e)}
+            }
+        )
+
+
+def convert_kiro_response_to_anthropic(kiro_response: dict, model: str, request_id: str) -> dict:
+    """将 Kiro 非流式响应转换为 Anthropic 格式"""
+    content = []
+
+    # 处理 output 字段
+    output = kiro_response.get("output", {})
+    message = output.get("message", {})
+
+    for item in message.get("content", []):
+        item_type = item.get("type", "")
+        if item_type == "text":
+            content.append({"type": "text", "text": item.get("text", "")})
+        elif item_type == "toolUse":
+            content.append({
+                "type": "tool_use",
+                "id": item.get("toolUseId", f"toolu_{uuid.uuid4().hex[:24]}"),
+                "name": item.get("name", ""),
+                "input": item.get("input", {})
+            })
+
+    # 处理 stop reason
+    stop_reason = output.get("stopReason", "end_turn")
+    if stop_reason == "tool_use":
+        stop_reason = "tool_use"
+    elif stop_reason in ("end_turn", "stop"):
+        stop_reason = "end_turn"
+
+    # 处理 usage
+    usage = kiro_response.get("usage", {})
+
+    return {
+        "id": f"msg_{request_id}",
+        "type": "message",
+        "role": "assistant",
+        "content": content,
+        "model": model,
+        "stop_reason": stop_reason,
+        "stop_sequence": None,
+        "usage": {
+            "input_tokens": usage.get("inputTokens", 0),
+            "output_tokens": usage.get("outputTokens", 0)
+        }
+    }
 
 
 # ==================== OpenAI API ====================
