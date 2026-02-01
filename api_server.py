@@ -90,6 +90,58 @@ Continue from here:""",
     "log_continuations": True,
 }
 
+# ==================== 上下文增强配置 ====================
+
+# 上下文增强机制 - 在用户新输入时注入项目背景信息
+CONTEXT_ENHANCEMENT_CONFIG = {
+    # 启用上下文增强
+    "enabled": os.getenv("CONTEXT_ENHANCEMENT_ENABLED", "true").lower() in ("1", "true", "yes"),
+
+    # 提取模型（使用 Sonnet 平衡速度和准确性）
+    "model": os.getenv("CONTEXT_ENHANCEMENT_MODEL", "claude-sonnet-4-5-20250929"),
+
+    # 上下文长度限制
+    "max_tokens": int(os.getenv("CONTEXT_ENHANCEMENT_MAX_TOKENS", "200")),
+    "min_tokens": int(os.getenv("CONTEXT_ENHANCEMENT_MIN_TOKENS", "100")),
+
+    # 更新策略：每 N 条用户消息更新一次
+    "update_interval": int(os.getenv("CONTEXT_ENHANCEMENT_UPDATE_INTERVAL", "10")),
+
+    # 是否与智能摘要集成（推荐）
+    "integrate_with_summary": os.getenv("CONTEXT_ENHANCEMENT_INTEGRATE_SUMMARY", "true").lower() in ("1", "true", "yes"),
+
+    # 上下文提取提示词模板
+    "extraction_prompt": """请分析以下对话历史，提取项目的核心上下文信息（100-200 tokens）：
+
+**必须包含**：
+1. 编程语言和主要框架
+2. 核心功能和业务领域
+3. 重要的技术约束或架构决策
+4. 当前正在处理的主要任务
+
+**格式要求**：
+- 使用简洁的短语，不要完整句子
+- 用 | 分隔不同信息点
+- 总长度控制在 100-200 tokens
+
+**示例输出**：
+Python + FastAPI | AI API 代理服务 | Anthropic/OpenAI 格式转换 | 历史消息管理与智能摘要 | 模型路由(Opus/Sonnet) | 当前任务：添加上下文增强功能
+
+对话历史：
+{conversation_history}
+
+请直接输出项目上下文，不要有任何前缀或解释：""",
+
+    # 增强消息模板
+    "enhancement_template": """<project_context>
+{context}
+</project_context>
+
+<user_request>
+{user_input}
+</user_request>""",
+}
+
 # 历史消息管理配置
 # 优化配置：平衡上下文保留和稳定性
 HISTORY_CONFIG = HistoryConfig(
@@ -710,6 +762,212 @@ def extract_user_content(messages: list[dict]) -> str:
             if isinstance(content, str):
                 return content
     return ""
+
+
+# ==================== 上下文增强机制 ====================
+
+# Session 上下文存储（内存）
+_session_contexts = {}
+
+
+def get_session_context(session_id: str) -> dict:
+    """获取 session 的项目上下文"""
+    return _session_contexts.get(session_id, {
+        "content": "",
+        "last_updated_at": 0,
+        "message_count_at_update": 0,
+        "version": 0,
+    })
+
+
+def update_session_context(session_id: str, context: str, message_count: int):
+    """更新 session 的项目上下文"""
+    _session_contexts[session_id] = {
+        "content": context,
+        "last_updated_at": time.time(),
+        "message_count_at_update": message_count,
+        "version": _session_contexts.get(session_id, {}).get("version", 0) + 1,
+    }
+
+
+def count_user_messages(messages: list[dict]) -> int:
+    """统计用户消息数量"""
+    return sum(1 for msg in messages if msg.get("role") == "user")
+
+
+async def extract_project_context(messages: list[dict], session_id: str) -> str:
+    """从对话历史中提取项目上下文
+
+    Args:
+        messages: 对话历史（建议传入最近 20 条）
+        session_id: 会话 ID
+
+    Returns:
+        项目上下文字符串（100-200 tokens）
+    """
+    if not CONTEXT_ENHANCEMENT_CONFIG["enabled"]:
+        return ""
+
+    if not messages:
+        return ""
+
+    # 格式化对话历史
+    conversation_history = []
+    for msg in messages[-20:]:  # 只看最近 20 条
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+
+        # 处理复杂 content 结构
+        if isinstance(content, list):
+            content_str = ""
+            for item in content:
+                if isinstance(item, dict):
+                    if item.get("type") == "text":
+                        content_str += item.get("text", "")
+                    elif item.get("type") == "tool_use":
+                        content_str += f"[Tool: {item.get('name', 'unknown')}]"
+                    elif item.get("type") == "tool_result":
+                        content_str += "[Tool Result]"
+            content = content_str
+
+        if isinstance(content, str) and content.strip():
+            # 截断过长的消息
+            if len(content) > 500:
+                content = content[:500] + "..."
+            conversation_history.append(f"{role}: {content}")
+
+    if not conversation_history:
+        return ""
+
+    # 构建提取提示词
+    prompt = CONTEXT_ENHANCEMENT_CONFIG["extraction_prompt"].format(
+        conversation_history="\n".join(conversation_history)
+    )
+
+    # 调用 LLM 提取上下文
+    context_id = uuid.uuid4().hex[:8]
+    request_body = {
+        "model": CONTEXT_ENHANCEMENT_CONFIG["model"],
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": False,
+        "max_tokens": CONTEXT_ENHANCEMENT_CONFIG["max_tokens"] + 50,  # 留一些余量
+    }
+
+    headers = {
+        "Authorization": f"Bearer {KIRO_API_KEY}",
+        "Content-Type": "application/json",
+        "X-Request-ID": f"context_{context_id}",
+        "X-Trace-ID": f"trace_{uuid.uuid4().hex}",
+    }
+
+    try:
+        client = get_http_client()
+        response = await client.post(
+            KIRO_PROXY_URL,
+            json=request_body,
+            headers=headers,
+            timeout=30.0,
+        )
+
+        if response.status_code == 200:
+            result = response.json()
+            context = result.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+
+            # 验证长度
+            if len(context) < CONTEXT_ENHANCEMENT_CONFIG["min_tokens"] * 4:  # 粗略估算
+                logger.warning(f"[{context_id}] 提取的上下文过短: {len(context)} chars")
+            elif len(context) > CONTEXT_ENHANCEMENT_CONFIG["max_tokens"] * 4:
+                logger.warning(f"[{context_id}] 提取的上下文过长，截断: {len(context)} chars")
+                context = context[:CONTEXT_ENHANCEMENT_CONFIG["max_tokens"] * 4]
+
+            logger.info(f"[{context_id}] ✅ 上下文提取成功: {len(context)} chars")
+            return context
+        else:
+            logger.error(f"[{context_id}] 上下文提取失败: {response.status_code}")
+            return ""
+
+    except Exception as e:
+        logger.error(f"[{context_id}] 上下文提取异常: {e}")
+        return ""
+
+
+async def enhance_user_message(messages: list[dict], session_id: str) -> list[dict]:
+    """增强用户消息（在最后一条用户消息中注入项目上下文）
+
+    Args:
+        messages: 原始消息列表
+        session_id: 会话 ID
+
+    Returns:
+        增强后的消息列表
+    """
+    if not CONTEXT_ENHANCEMENT_CONFIG["enabled"]:
+        return messages
+
+    if not messages:
+        return messages
+
+    # 检查最后一条是否是用户消息
+    if messages[-1].get("role") != "user":
+        return messages
+
+    # 获取当前上下文
+    session_context = get_session_context(session_id)
+    user_message_count = count_user_messages(messages)
+
+    # 判断是否需要更新上下文
+    should_update = (
+        not session_context["content"] or  # 首次
+        user_message_count - session_context["message_count_at_update"] >= CONTEXT_ENHANCEMENT_CONFIG["update_interval"]  # 超过间隔
+    )
+
+    if should_update:
+        logger.info(f"[{session_id}] 🔄 触发上下文提取（用户消息数: {user_message_count}）")
+        context = await extract_project_context(messages, session_id)
+        if context:
+            update_session_context(session_id, context, user_message_count)
+            session_context = get_session_context(session_id)
+    else:
+        context = session_context["content"]
+
+    # 如果没有上下文，直接返回
+    if not context:
+        return messages
+
+    # 增强最后一条用户消息
+    enhanced_messages = messages.copy()
+    last_message = enhanced_messages[-1].copy()
+    original_content = last_message.get("content", "")
+
+    # 处理复杂 content 结构
+    if isinstance(original_content, list):
+        # 如果是列表，找到第一个 text 类型并增强
+        enhanced_content = []
+        text_enhanced = False
+        for item in original_content:
+            if isinstance(item, dict) and item.get("type") == "text" and not text_enhanced:
+                enhanced_text = CONTEXT_ENHANCEMENT_CONFIG["enhancement_template"].format(
+                    context=context,
+                    user_input=item.get("text", "")
+                )
+                enhanced_content.append({"type": "text", "text": enhanced_text})
+                text_enhanced = True
+            else:
+                enhanced_content.append(item)
+        last_message["content"] = enhanced_content
+    elif isinstance(original_content, str):
+        # 如果是字符串，直接增强
+        enhanced_text = CONTEXT_ENHANCEMENT_CONFIG["enhancement_template"].format(
+            context=context,
+            user_input=original_content
+        )
+        last_message["content"] = enhanced_text
+
+    enhanced_messages[-1] = last_message
+
+    logger.info(f"[{session_id}] 🎯 上下文增强完成: {len(original_content) if isinstance(original_content, str) else 'complex'} -> {len(str(last_message['content']))} chars")
+
+    return enhanced_messages
 
 
 # 摘要生成模型配置
@@ -2588,6 +2846,8 @@ def convert_openai_to_anthropic(openai_response: dict, model: str, request_id: s
         "usage": {
             "input_tokens": openai_response.get("usage", {}).get("prompt_tokens", 0),
             "output_tokens": openai_response.get("usage", {}).get("completion_tokens", 0),
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
         }
     }
 
@@ -2636,13 +2896,20 @@ async def anthropic_messages(request: Request):
         if "opus" in original_model.lower():
             logger.info(f"[{request_id}] ✅ 保留 Opus: {route_reason}")
 
+    # ==================== 上下文增强 ====================
+    # 在历史管理前增强用户消息
+    messages = body.get("messages", [])
+    session_id = generate_session_id(messages)
+
+    # 增强最后一条用户消息（注入项目上下文）
+    messages = await enhance_user_message(messages, session_id)
+    body["messages"] = messages
+
     # ==================== 历史消息管理 ====================
     # 创建历史管理器（与 /v1/chat/completions 保持一致）
-    session_id = generate_session_id(body.get("messages", []))
     manager = HistoryManager(HISTORY_CONFIG, cache_key=session_id)
 
     # 预处理消息（截断/摘要）
-    messages = body.get("messages", [])
     user_content = extract_user_content(messages)
 
     # 计算原始消息大小
@@ -2658,6 +2925,15 @@ async def anthropic_messages(request: Request):
         processed_messages = await manager.pre_process_async(
             messages, user_content, call_kiro_for_summary
         )
+
+        # 与智能摘要集成：摘要时同步更新上下文
+        if CONTEXT_ENHANCEMENT_CONFIG["integrate_with_summary"]:
+            logger.info(f"[{request_id}] 🔄 摘要触发，同步更新项目上下文...")
+            context = await extract_project_context(messages, session_id)
+            if context:
+                user_message_count = count_user_messages(messages)
+                update_session_context(session_id, context, user_message_count)
+                logger.info(f"[{request_id}] ✅ 项目上下文已更新")
     else:
         processed_messages = manager.pre_process(messages, user_content)
 
@@ -2764,7 +3040,7 @@ async def handle_anthropic_stream_via_openai(
                     "model": model,
                     "stop_reason": None,
                     "stop_sequence": None,
-                    "usage": {"input_tokens": estimated_input_tokens, "output_tokens": 0}
+                    "usage": {"input_tokens": estimated_input_tokens, "output_tokens": 0, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}
                 }
             }
             yield f"data: {json.dumps(msg_start)}\n\n".encode()
@@ -2911,7 +3187,7 @@ async def handle_anthropic_stream_via_openai(
                                f"finish_reason={finish_reason}")
 
             # message delta with token usage
-            yield f'data: {{"type":"message_delta","delta":{{"stop_reason":"{finish_reason}","stop_sequence":null}},"usage":{{"output_tokens":{output_tokens}}}}}\n\n'.encode()
+            yield f'data: {{"type":"message_delta","delta":{{"stop_reason":"{finish_reason}","stop_sequence":null}},"usage":{{"output_tokens":{output_tokens},"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}}\n\n'.encode()
 
             # message stop
             yield f'data: {{"type":"message_stop"}}\n\n'.encode()
@@ -3030,8 +3306,13 @@ async def chat_completions(request: Request):
 
     logger.info(f"[{request_id}] Request: model={model}, messages={len(messages)}, stream={stream}")
 
-    # 创建历史管理器
+    # ==================== 上下文增强 ====================
+    # 在历史管理前增强用户消息
     session_id = generate_session_id(messages)
+    messages = await enhance_user_message(messages, session_id)
+    body["messages"] = messages
+
+    # 创建历史管理器
     manager = HistoryManager(HISTORY_CONFIG, cache_key=session_id)
 
     # 预处理消息
