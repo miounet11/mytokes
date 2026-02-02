@@ -1,0 +1,29 @@
+# AI History Manager Dependencies
+# Python 3.10+
+
+# Web Framework
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+starlette>=0.35.0
+
+# HTTP Client
+httpx[http2]>=0.26.0
+
+# Data Validation
+pydantic>=2.5.0
+pydantic-settings>=2.1.0
+
+# Async Support
+anyio>=4.2.0
+
+# Utilities
+python-dotenv>=1.0.0
+orjson>=3.9.0
+
+# Development (optional)
+# pytest>=7.4.0
+# pytest-asyncio>=0.23.0
+# pytest-cov>=4.1.0
+# black>=24.1.0
+# ruff>=0.1.0
+# mypy>=1.8.0
