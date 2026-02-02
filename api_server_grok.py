@@ -30,7 +30,6 @@ from pydantic import BaseModel
 
 from ai_history_manager import HistoryManager, HistoryConfig, TruncateStrategy
 from ai_history_manager.utils import is_content_length_error
-from hallucination_detection import detect_hallucinated_tool_result
 
 # ==================== 配置 ====================
 
@@ -190,14 +189,18 @@ ANTHROPIC_EMPTY_ASSISTANT_PLACEHOLDER = os.getenv("ANTHROPIC_EMPTY_ASSISTANT_PLA
 TOOL_DESC_MAX_CHARS = int(os.getenv("TOOL_DESC_MAX_CHARS", "8000"))
 TOOL_PARAM_DESC_MAX_CHARS = int(os.getenv("TOOL_PARAM_DESC_MAX_CHARS", "4000"))
 
+# CLI 兼容性配置
+# 限制输出长度以避免 Claude Code CLI 解析问题（~25000 tokens）
+MAX_CLI_OUTPUT_CHARS = int(os.getenv("MAX_CLI_OUTPUT_CHARS", "100000"))
+
 # ==================== 智能模型路由配置 ====================
 
-# 模型路由配置 - 智能判断何时使用 Opus vs Sonnet
+# 模型路由配置 - Opus 优先策略
 # 设计原则：
-# 1. Opus 用于真正需要深度推理的关键时刻（创建、设计、架构）
-# 2. Sonnet 用于执行性任务（工具调用、简单修改）
-# 3. 保证 10-20% 的 Opus 使用比例
-# 4. Extended Thinking 和 Agent 调用场景使用 Opus
+# 1. 请求 Sonnet 时：直接使用 Sonnet，不做路由
+# 2. 请求 Opus 时：尽可能使用 Opus，只有在特定条件下才降级
+# 3. Opus 质量更高，优先保证 Opus 使用率
+# 4. 只有在明确的执行性任务时才考虑降级到 Sonnet
 MODEL_ROUTING_CONFIG = {
     # 启用智能路由
     "enabled": True,
@@ -207,29 +210,29 @@ MODEL_ROUTING_CONFIG = {
     "sonnet_model": "claude-sonnet-4-5-20250929",
 
     # ============================================================
-    # 第零优先级：强制 Opus 的场景（不受其他条件影响）
+    # 核心策略：Opus 优先
+    # ============================================================
+    # 请求 Sonnet 时是否允许路由（False = 直接用 Sonnet）
+    "route_sonnet_requests": False,
+
+    # ============================================================
+    # 强制使用 Opus 的场景（100% Opus）
     # ============================================================
     # Extended Thinking 请求 - 必须使用 Opus
     "force_opus_on_thinking": True,
 
-    # 主 Agent 请求（非子 Agent）- 更高概率用 Opus
-    "main_agent_opus_probability": 60,  # 主 Agent 60% 概率用 Opus
-
-    # ============================================================
-    # 第一优先级：强制 Opus 的关键词（最后一条用户消息包含）
-    # 这些是真正需要深度思考的任务
-    # ============================================================
+    # 强制 Opus 的关键词（最后一条用户消息包含）
     "force_opus_keywords": [
-        # 创建类 - 完整的创建任务
+        # 创建类
         "创建项目", "新建项目", "初始化项目", "搭建项目",
         "create project", "new project", "init project",
-        # 设计架构类 - 需要架构思维
+        # 设计架构类
         "设计架构", "系统设计", "架构设计", "方案设计", "设计",
         "design architecture", "system design", "architecture design", "design",
         # 深度分析类
         "分析", "梳理", "检查问题", "全面分析", "详细分析", "根因分析", "诊断",
         "analysis", "analyze", "diagnose", "investigate",
-        # 重构类 - 大规模重构
+        # 重构类
         "重构", "整体重构", "大规模重构",
         "refactor", "major refactor", "complete refactor",
         # 规划类
@@ -240,47 +243,40 @@ MODEL_ROUTING_CONFIG = {
     ],
 
     # ============================================================
-    # 第二优先级：强制 Sonnet 的关键词（执行性任务）
+    # 可降级到 Sonnet 的场景（仅当请求 Opus 时生效）
+    # 这些是明确的执行性任务，降级不影响质量
     # ============================================================
-    "force_sonnet_keywords": [
-        # 简单操作
-        "看看", "显示", "列出", "打开",
-        "show", "list", "display", "view", "open",
-        # 小改动
-        "修复", "调整", "更新", "改一下", "改成",
-        "fix", "adjust", "update",
-        # 执行命令
+    "downgrade_to_sonnet_keywords": [
+        # 仅保留最明确的执行性任务
         "运行", "执行", "启动", "重启", "停止",
         "run", "execute", "start", "restart", "stop",
-        # 简单问答
-        "什么是", "哪里", "是不是", "有没有",
-        "what is", "where", "is it", "do you",
-        # 读取类
-        "读取", "获取", "搜索",
-        "read", "get", "search", "find",
         # 安装类
         "安装", "下载",
         "install", "download",
     ],
 
-    # ============================================================
-    # 第三优先级：基于对话阶段的智能判断
-    # ============================================================
-
-    # 首轮对话检测 - 新任务开始需要一定概率 Opus
-    "first_turn_opus_probability": 90,    # 首轮 50% 概率用 Opus
-
-    # 用户消息数阈值（不含 system）- 判断是否为首轮
-    "first_turn_max_user_messages": 2,    # <= 2 条用户消息视为首轮
-
-    # 工具执行阶段检测 - 大量工具调用说明在执行阶段
-    "execution_phase_tool_calls": 5,      # 工具调用 >= 5 次视为执行阶段
-    "execution_phase_sonnet_probability": 80,  # 执行阶段 90% 用 Sonnet
+    # 降级概率（即使匹配降级关键词，也只有一定概率降级）
+    "downgrade_probability": 70,  # 匹配降级关键词时 70% 概率降级
 
     # ============================================================
-    # 第四优先级：保底概率（确保 10-20% Opus 使用率）
+    # 执行阶段检测（大量工具调用时可考虑降级）
     # ============================================================
-    "base_opus_probability": 30,          # 基础 15% 概率使用 Opus
+    "execution_phase_tool_calls": 8,      # 工具调用 >= 8 次视为执行阶段
+    "execution_phase_downgrade_probability": 50,  # 执行阶段 50% 概率降级
+
+    # ============================================================
+    # P0 优化：会话连续性
+    # ============================================================
+    # 保持会话中模型一致性（避免中途切换导致质量下降）
+    "maintain_model_consistency": True,
+
+    # ============================================================
+    # P1 优化：复杂度评估
+    # ============================================================
+    # 复杂度阈值，>= 此值强制使用 Opus
+    "complexity_threshold_for_opus": 70,
+    # 启用复杂度评估
+    "enable_complexity_evaluation": True,
 
     # ============================================================
     # 调试和监控
@@ -331,7 +327,12 @@ _RE_FILE_PATH = re.compile(r'[/\\][\w\-\.]+\.(py|js|ts|jsx|tsx|go|rs|java|cpp|c|
 
 
 class ModelRouter:
-    """智能模型路由器 - 根据请求复杂度决定使用 Opus 还是 Sonnet"""
+    """智能模型路由器 - Opus 优先策略
+
+    核心原则：
+    - 请求 Sonnet → 直接使用 Sonnet
+    - 请求 Opus → 尽可能使用 Opus，只有特定条件才降级
+    """
 
     def __init__(self, config: dict = None):
         self.config = config or MODEL_ROUTING_CONFIG
@@ -339,7 +340,7 @@ class ModelRouter:
         self._lock = asyncio.Lock()
         # 预处理关键词为小写，避免每次匹配时重复转换
         self._opus_keywords_lower = [kw.lower() for kw in self.config.get("force_opus_keywords", [])]
-        self._sonnet_keywords_lower = [kw.lower() for kw in self.config.get("force_sonnet_keywords", [])]
+        self._downgrade_keywords_lower = [kw.lower() for kw in self.config.get("downgrade_to_sonnet_keywords", [])]
 
     def _count_chars(self, messages: list, system: str = "") -> int:
         """统计总字符数"""
@@ -468,147 +469,283 @@ class ModelRouter:
                         return True
         return False
 
-    def should_use_opus(self, request_body: dict) -> tuple[bool, str]:
+    # ============================================================
+    # P0 优化：会话连续性感知
+    # ============================================================
+    def _should_maintain_model_consistency(self, messages: list) -> tuple[bool, str]:
         """
-        智能判断是否应该使用 Opus
+        检测是否应该保持模型一致性（避免中途切换导致质量下降）
 
-        决策优先级：
-        0. Extended Thinking 请求 → 强制 Opus
-        0b. 主 Agent 请求 → 高概率 Opus
-        1. 强制 Opus 关键词 → Opus
-        2. 强制 Sonnet 关键词 → Sonnet
-        3. 首轮对话（新任务）→ 概率 Opus
-        4. 执行阶段（大量工具调用）→ 高概率 Sonnet
-        5. 保底概率 → 确保 ~15% Opus
+        场景：
+        1. 上一轮 AI 回复表明任务未完成
+        2. 正在进行多步骤操作
+        3. 代码编写/调试过程中
 
         Returns:
-            (should_use_opus, reason)
+            (should_maintain, reason)
+        """
+        if len(messages) < 2:
+            return False, ""
+
+        # 查找最后一条 assistant 消息
+        last_assistant_content = ""
+        for msg in reversed(messages):
+            if msg.get("role") == "assistant":
+                content = msg.get("content", "")
+                if isinstance(content, str):
+                    last_assistant_content = content
+                elif isinstance(content, list):
+                    texts = []
+                    for item in content:
+                        if isinstance(item, dict):
+                            if item.get("type") == "text":
+                                texts.append(item.get("text", ""))
+                    last_assistant_content = " ".join(texts)
+                break
+
+        if not last_assistant_content:
+            return False, ""
+
+        # 检测未完成标记（中英文）
+        incomplete_markers = [
+            # 中文
+            "让我继续", "接下来", "下一步", "继续", "然后",
+            "我来", "现在", "首先", "接着",
+            # 英文
+            "let me continue", "next", "i'll", "let me",
+            "now i", "first", "then", "continuing",
+            # 代码相关
+            "```",  # 代码块可能未完成
+        ]
+
+        content_lower = last_assistant_content.lower()[:500]  # 只检查前500字符
+        for marker in incomplete_markers:
+            if marker.lower() in content_lower:
+                return True, f"会话连续性[{marker}]"
+
+        return False, ""
+
+    # ============================================================
+    # P1 优化：任务复杂度评估
+    # ============================================================
+    def _estimate_task_complexity(self, request_body: dict) -> int:
+        """
+        评估任务复杂度 (0-100)
+
+        高复杂度任务应该使用 Opus 以保证质量
+        """
+        score = 50  # 基础分
+        messages = request_body.get("messages", [])
+        last_msg = self._get_last_user_message(messages)
+
+        # 1. 消息长度加分（长消息通常更复杂）
+        msg_len = len(last_msg)
+        if msg_len > 1000:
+            score += 20
+        elif msg_len > 500:
+            score += 15
+        elif msg_len > 200:
+            score += 8
+
+        # 2. 代码块数量加分
+        code_blocks = last_msg.count("```")
+        score += min(code_blocks * 5, 15)
+
+        # 3. 问号数量（多问题 = 复杂）
+        questions = last_msg.count("?") + last_msg.count("？")
+        score += min(questions * 3, 10)
+
+        # 4. 文件路径数量
+        file_matches = _RE_FILE_PATH.findall(last_msg)
+        score += min(len(file_matches) * 2, 10)
+
+        # 5. 对话轮数（长对话可能是复杂任务）
+        user_msg_count = self._count_user_messages(messages)
+        if user_msg_count > 10:
+            score += 10
+        elif user_msg_count > 5:
+            score += 5
+
+        # 6. 特殊复杂度标记
+        complexity_markers = [
+            "复杂", "困难", "棘手", "全面", "完整", "详细",
+            "complex", "difficult", "comprehensive", "complete", "detailed",
+            "多个", "所有", "整个", "全部",
+            "multiple", "all", "entire", "whole",
+        ]
+        msg_lower = last_msg.lower()
+        for marker in complexity_markers:
+            if marker in msg_lower:
+                score += 5
+                break
+
+        return min(score, 100)
+
+    def _should_downgrade_opus(self, request_body: dict) -> tuple[bool, str]:
+        """
+        判断 Opus 请求是否应该降级到 Sonnet（Opus 优先策略）
+
+        核心原则：默认使用 Opus，只有明确的降级条件才使用 Sonnet
+
+        优化策略（按优先级）：
+        1. P0 快速路径 - 提前返回减少计算
+        2. P0 会话连续性 - 保持模型一致性
+        3. P1 复杂度评估 - 高复杂度强制 Opus
+        4. 原有逻辑 - 关键词匹配、执行阶段检测
+
+        Returns:
+            (should_downgrade, reason) - True 表示降级到 Sonnet
         """
         if not self.config.get("enabled", True):
-            return True, "路由已禁用"
+            return False, "路由已禁用,保持Opus"
 
         messages = request_body.get("messages", [])
         last_user_msg = self._get_last_user_message(messages)
-
-        # 生成稳定的哈希种子（相同请求得到相同结果）
         hash_seed = f"{len(messages)}:{last_user_msg[:200]}"
 
         # ============================================================
-        # 第零优先级：特殊场景强制 Opus
+        # P0 快速路径：强制使用 Opus 的场景（绝不降级）
         # ============================================================
 
-        # 0a. Extended Thinking 请求 - 必须使用 Opus
+        # Extended Thinking 请求 - 必须使用 Opus
         if self.config.get("force_opus_on_thinking", True) and self._has_thinking_request(request_body):
-            return True, "ExtendedThinking"
+            return False, "ExtendedThinking强制Opus"
 
-        # 0b. 主 Agent 请求（非子 Agent）- 更高概率用 Opus
-        is_sub_agent = self._is_sub_agent_request(messages)
-        if not is_sub_agent:
-            main_agent_prob = self.config.get("main_agent_opus_probability", 60)
-            # 只在首轮（新任务开始）时应用主 Agent 概率
-            user_msg_count = self._count_user_messages(messages)
-            if user_msg_count <= 2:
-                if self._get_hash_probability(hash_seed + ":main", main_agent_prob):
-                    return True, f"主Agent首轮({main_agent_prob}%)"
-
-        # ============================================================
-        # 第一优先级：强制 Opus 关键词（使用预处理的小写关键词）
-        # ============================================================
+        # 强制 Opus 关键词
         found, matched_kw = self._contains_keywords_optimized(last_user_msg, self._opus_keywords_lower)
         if found:
-            return True, f"关键词[{matched_kw}]"
+            return False, f"Opus关键词[{matched_kw}]"
 
         # ============================================================
-        # 第二优先级：强制 Sonnet 关键词（使用预处理的小写关键词）
+        # P0 优化：会话连续性检测
+        # 如果上一轮任务未完成，保持使用 Opus 避免质量下降
         # ============================================================
-        found, matched_kw = self._contains_keywords_optimized(last_user_msg, self._sonnet_keywords_lower)
-        if found:
-            return False, f"简单任务[{matched_kw}]"
+        if self.config.get("maintain_model_consistency", True):
+            should_maintain, reason = self._should_maintain_model_consistency(messages)
+            if should_maintain:
+                return False, f"Opus保持:{reason}"
 
         # ============================================================
-        # 第三优先级：对话阶段判断
+        # P1 优化：复杂度评估
+        # 高复杂度任务强制使用 Opus
         # ============================================================
-        user_msg_count = self._count_user_messages(messages)
+        if self.config.get("enable_complexity_evaluation", True):
+            complexity = self._estimate_task_complexity(request_body)
+            threshold = self.config.get("complexity_threshold_for_opus", 70)
+            if complexity >= threshold:
+                return False, f"高复杂度({complexity})强制Opus"
+
+        # ============================================================
+        # 可降级的场景（但概率较低）
+        # ============================================================
+
+        # 子 Agent 请求 - 可以降级以节省成本
+        if self._is_sub_agent_request(messages):
+            return True, "子Agent降级"
+
+        # 降级关键词检查（仅限明确的执行性任务）
+        if self._downgrade_keywords_lower:
+            found, matched_kw = self._contains_keywords_optimized(last_user_msg, self._downgrade_keywords_lower)
+            if found:
+                prob = self.config.get("downgrade_probability", 70)
+                if self._get_hash_probability(hash_seed + ":downgrade_kw", prob):
+                    return True, f"降级关键词[{matched_kw}]({prob}%)"
+
+        # 执行阶段检测（大量工具调用）
         tool_calls = self._count_tool_calls(messages)
-
-        # 3a. 首轮对话检测 - 新任务开始更需要 Opus
-        first_turn_max = self.config.get("first_turn_max_user_messages", 2)
-        if user_msg_count <= first_turn_max:
-            first_turn_prob = self.config.get("first_turn_opus_probability", 50)
-            if self._get_hash_probability(hash_seed + ":first", first_turn_prob):
-                return True, f"首轮对话({user_msg_count}条,{first_turn_prob}%)"
-            else:
-                return False, f"首轮随机Sonnet({user_msg_count}条)"
-
-        # 3b. 执行阶段检测 - 大量工具调用说明在执行，用 Sonnet
-        execution_threshold = self.config.get("execution_phase_tool_calls", 5)
-        if tool_calls >= execution_threshold:
-            sonnet_prob = self.config.get("execution_phase_sonnet_probability", 90)
-            if self._get_hash_probability(hash_seed + ":exec", sonnet_prob):
-                return False, f"执行阶段({tool_calls}次工具,{sonnet_prob}%Sonnet)"
-            else:
-                return True, f"执行阶段随机Opus({tool_calls}次工具)"
+        exec_threshold = self.config.get("execution_phase_tool_calls", 8)
+        if tool_calls >= exec_threshold:
+            prob = self.config.get("execution_phase_downgrade_probability", 50)
+            if self._get_hash_probability(hash_seed + ":exec_phase", prob):
+                return True, f"执行阶段降级({tool_calls}次工具,{prob}%)"
 
         # ============================================================
-        # 第四优先级：保底概率
+        # 默认：不降级，使用 Opus
         # ============================================================
-        base_opus_prob = self.config.get("base_opus_probability", 15)
-        if self._get_hash_probability(hash_seed + ":base", base_opus_prob):
-            return True, f"保底概率({base_opus_prob}%)"
-        else:
-            return False, f"默认Sonnet(msg={user_msg_count},tools={tool_calls})"
+        return False, "Opus优先"
 
     async def route(self, request_body: dict) -> tuple[str, str]:
         """
-        路由到合适的模型（线程安全版本）
+        路由到合适的模型（线程安全版本）- Opus 优先策略
+
+        核心原则：
+        1. 请求 Sonnet → 直接使用 Sonnet（快速路径）
+        2. 请求 Opus → 尽可能使用 Opus，只有特定条件才降级
+
+        P0 优化：快速路径提前返回，减少不必要的计算
 
         Returns:
             (routed_model, reason)
         """
         original_model = request_body.get("model", "")
+        model_lower = original_model.lower()
+        opus_model = self.config.get("opus_model", "claude-opus-4-5-20251101")
+        sonnet_model = self.config.get("sonnet_model", "claude-sonnet-4-5-20250929")
 
-        # 只处理 Opus 请求
-        if "opus" not in original_model.lower():
-            async with self._lock:
-                self.stats["other"] += 1
-            return original_model, "非Opus请求"
+        # ============================================================
+        # P0 快速路径 1：非 Claude 模型，直接返回（无需任何判断）
+        # ============================================================
+        if "claude" not in model_lower:
+            # 完全不是 Claude 模型，直接透传
+            self.stats["other"] += 1  # Python GIL 保证原子性
+            return original_model, "非Claude模型"
 
-        should_opus, reason = self.should_use_opus(request_body)
-
-        async with self._lock:
-            if should_opus:
-                self.stats["opus"] += 1
-            else:
+        # ============================================================
+        # P0 快速路径 2：Sonnet 请求直接返回（无需降级判断）
+        # ============================================================
+        if "sonnet" in model_lower:
+            if not self.config.get("route_sonnet_requests", False):
                 self.stats["sonnet"] += 1
+                return sonnet_model, "Sonnet直接"
 
-        if should_opus:
-            return self.config.get("opus_model", "claude-opus-4-5-20251101"), reason
+        # ============================================================
+        # Opus 请求：进入完整的降级判断逻辑
+        # ============================================================
+        should_downgrade, reason = self._should_downgrade_opus(request_body)
+
+        # 更新统计（Python GIL 保证 += 操作的原子性）
+        if should_downgrade:
+            self.stats["sonnet"] += 1
+            return sonnet_model, f"Opus降级:{reason}"
         else:
-            return self.config.get("sonnet_model", "claude-sonnet-4-5-20250929"), reason
+            self.stats["opus"] += 1
+            return opus_model, reason
 
     def route_sync(self, request_body: dict) -> tuple[str, str]:
         """
-        路由到合适的模型（同步版本，用于非异步上下文）
-        注意：统计数据在高并发下可能不精确
+        路由到合适的模型（同步版本）- Opus 优先策略
+
+        与 async route() 逻辑完全一致，用于同步上下文
+        Python GIL 保证 += 操作的原子性，无需额外锁
 
         Returns:
             (routed_model, reason)
         """
         original_model = request_body.get("model", "")
+        model_lower = original_model.lower()
+        opus_model = self.config.get("opus_model", "claude-opus-4-5-20251101")
+        sonnet_model = self.config.get("sonnet_model", "claude-sonnet-4-5-20250929")
 
-        # 只处理 Opus 请求
-        if "opus" not in original_model.lower():
+        # P0 快速路径 1：非 Claude 模型
+        if "claude" not in model_lower:
             self.stats["other"] += 1
-            return original_model, "非Opus请求"
+            return original_model, "非Claude模型"
 
-        should_opus, reason = self.should_use_opus(request_body)
+        # P0 快速路径 2：Sonnet 请求直接返回
+        if "sonnet" in model_lower:
+            if not self.config.get("route_sonnet_requests", False):
+                self.stats["sonnet"] += 1
+                return sonnet_model, "Sonnet直接"
 
-        if should_opus:
-            self.stats["opus"] += 1
-            return self.config.get("opus_model", "claude-opus-4-5-20251101"), reason
-        else:
+        # Opus 请求：进入完整的降级判断逻辑
+        should_downgrade, reason = self._should_downgrade_opus(request_body)
+
+        if should_downgrade:
             self.stats["sonnet"] += 1
-            return self.config.get("sonnet_model", "claude-sonnet-4-5-20250929"), reason
+            return sonnet_model, f"Opus降级:{reason}"
+        else:
+            self.stats["opus"] += 1
+            return opus_model, reason
 
     def get_stats(self) -> dict:
         """获取路由统计"""
@@ -737,22 +874,57 @@ class ChatCompletionRequest(BaseModel):
 
 # ==================== 辅助函数 ====================
 
-def generate_session_id(messages: list[dict]) -> str:
-    """基于消息内容生成会话 ID"""
-    if not messages:
-        return "default"
+def generate_session_id(
+    messages: list[dict],
+    working_dir: str = "",
+    client_ip: str = "",
+    client_port: int = 0
+) -> str:
+    """基于工作目录、客户端标识和消息内容生成会话 ID
+
+    隔离优先级：
+    1. 工作目录 (X-Working-Directory) - 最可靠
+    2. 客户端 IP + 端口 - 后备方案，区分不同终端
+    3. 消息内容 - 辅助区分
+
+    Args:
+        messages: 消息列表
+        working_dir: 当前工作目录（从请求头 X-Working-Directory 获取）
+        client_ip: 客户端 IP 地址
+        client_port: 客户端端口号
+
+    Returns:
+        会话 ID（16 字符哈希）
+    """
+    import hashlib
 
     content_parts = []
+
+    # 1. 工作目录作为主要隔离依据（最重要）
+    if working_dir:
+        content_parts.append(f"cwd:{working_dir}")
+
+    # 2. 客户端标识作为后备（区分不同终端）
+    if client_ip:
+        content_parts.append(f"client:{client_ip}:{client_port}")
+
+    # 3. 消息内容作为辅助（区分同一目录下的不同会话）
+    if not messages:
+        if content_parts:
+            return hashlib.md5("".join(content_parts).encode()).hexdigest()[:16]
+        # 最后的后备：生成随机 ID（而不是 "default"）
+        return f"anon_{uuid.uuid4().hex[:12]}"
+
     for msg in messages[:3]:
         content = msg.get("content", "")
         if isinstance(content, str):
             content_parts.append(content[:100])
 
     if content_parts:
-        import hashlib
         return hashlib.md5("".join(content_parts).encode()).hexdigest()[:16]
 
-    return "default"
+    # 最后的后备：生成随机 ID
+    return f"anon_{uuid.uuid4().hex[:12]}"
 
 
 def extract_user_content(messages: list[dict]) -> str:
@@ -765,6 +937,70 @@ def extract_user_content(messages: list[dict]) -> str:
     return ""
 
 
+# ==================== 后台任务管理 ====================
+
+# 后台任务集合 - 用于跟踪和管理后台任务
+_background_tasks: set[asyncio.Task] = set()
+
+# 摘要缓存 - session_id -> {"summary": str, "version": int, "timestamp": float}
+_summary_cache: dict[str, dict] = {}
+
+# 摘要任务锁 - 防止同一 session 并发生成摘要
+_summary_locks: dict[str, asyncio.Lock] = {}
+
+
+def get_summary_lock(session_id: str) -> asyncio.Lock:
+    """获取 session 的摘要锁（懒创建）"""
+    if session_id not in _summary_locks:
+        _summary_locks[session_id] = asyncio.Lock()
+    return _summary_locks[session_id]
+
+
+def schedule_background_task(coro, task_name: str = "background"):
+    """调度后台任务（非阻塞）
+
+    Args:
+        coro: 协程对象
+        task_name: 任务名称（用于日志）
+
+    Returns:
+        asyncio.Task 对象
+    """
+    task = asyncio.create_task(coro, name=task_name)
+    _background_tasks.add(task)
+
+    def on_done(t):
+        _background_tasks.discard(t)
+        if t.exception():
+            logger.error(f"后台任务 [{task_name}] 异常: {t.exception()}")
+        else:
+            logger.debug(f"后台任务 [{task_name}] 完成")
+
+    task.add_done_callback(on_done)
+    return task
+
+
+async def run_with_timeout(coro, timeout: float, task_name: str = "task"):
+    """带超时的协程执行
+
+    Args:
+        coro: 协程对象
+        timeout: 超时时间（秒）
+        task_name: 任务名称
+
+    Returns:
+        协程结果，超时返回 None
+    """
+    try:
+        return await asyncio.wait_for(coro, timeout=timeout)
+    except asyncio.TimeoutError:
+        logger.warning(f"任务 [{task_name}] 超时 ({timeout}s)")
+        return None
+    except Exception as e:
+        logger.error(f"任务 [{task_name}] 异常: {e}")
+        return None
+
+
 # ==================== 上下文增强机制 ====================
 
 # Session 上下文存储（内存）
@@ -775,20 +1011,70 @@ def get_session_context(session_id: str) -> dict:
     """获取 session 的项目上下文"""
     return _session_contexts.get(session_id, {
         "content": "",
+        "working_dir": "",
         "last_updated_at": 0,
         "message_count_at_update": 0,
         "version": 0,
     })
 
 
-def update_session_context(session_id: str, context: str, message_count: int):
-    """更新 session 的项目上下文"""
+def update_session_context(session_id: str, context: str, message_count: int, working_dir: str = ""):
+    """更新 session 的项目上下文
+
+    Args:
+        session_id: 会话 ID
+        context: 项目上下文内容
+        message_count: 当前用户消息数
+        working_dir: 当前工作目录
+    """
     _session_contexts[session_id] = {
         "content": context,
+        "working_dir": working_dir,
         "last_updated_at": time.time(),
         "message_count_at_update": message_count,
         "version": _session_contexts.get(session_id, {}).get("version", 0) + 1,
     }
+
+
+def check_working_dir_changed(session_id: str, current_working_dir: str) -> bool:
+    """检查工作目录是否发生变化
+
+    如果工作目录变化，说明用户切换了项目，需要清除旧上下文。
+
+    Args:
+        session_id: 会话 ID
+        current_working_dir: 当前工作目录
+
+    Returns:
+        True 如果工作目录发生变化
+    """
+    if not current_working_dir:
+        return False
+
+    session_context = _session_contexts.get(session_id, {})
+    stored_working_dir = session_context.get("working_dir", "")
+
+    # 如果没有存储的工作目录，不算变化
+    if not stored_working_dir:
+        return False
+
+    # 比较工作目录
+    return stored_working_dir != current_working_dir
+
+
+def clear_session_context(session_id: str) -> bool:
+    """清除 session 的项目上下文
+
+    Args:
+        session_id: 会话 ID
+
+    Returns:
+        True 如果成功清除
+    """
+    if session_id in _session_contexts:
+        del _session_contexts[session_id]
+        return True
+    return False
 
 
 def count_user_messages(messages: list[dict]) -> int:
@@ -892,12 +1178,13 @@ async def extract_project_context(messages: list[dict], session_id: str) -> str:
         return ""
 
 
-async def enhance_user_message(messages: list[dict], session_id: str) -> list[dict]:
+async def enhance_user_message(messages: list[dict], session_id: str, working_dir: str = "") -> list[dict]:
     """增强用户消息（在最后一条用户消息中注入项目上下文）
 
     Args:
         messages: 原始消息列表
         session_id: 会话 ID
+        working_dir: 当前工作目录（用于检测项目切换）
 
     Returns:
         增强后的消息列表
@@ -912,6 +1199,16 @@ async def enhance_user_message(messages: list[dict], session_id: str) -> list[di
     if messages[-1].get("role") != "user":
         return messages
 
+    # 🔒 检测工作目录变化（项目切换检测）
+    if working_dir and check_working_dir_changed(session_id, working_dir):
+        old_context = get_session_context(session_id)
+        logger.warning(
+            f"[{session_id}] ⚠️ 检测到项目切换！"
+            f"旧目录: {old_context.get('working_dir', 'unknown')} -> 新目录: {working_dir}"
+        )
+        clear_session_context(session_id)
+        logger.info(f"[{session_id}] 🧹 已清除旧项目上下文，防止上下文污染")
+
     # 获取当前上下文
     session_context = get_session_context(session_id)
     user_message_count = count_user_messages(messages)
@@ -923,11 +1220,25 @@ async def enhance_user_message(messages: list[dict], session_id: str) -> list[di
     )
 
     if should_update:
-        logger.info(f"[{session_id}] 🔄 触发上下文提取（用户消息数: {user_message_count}）")
-        context = await extract_project_context(messages, session_id)
-        if context:
-            update_session_context(session_id, context, user_message_count)
-            session_context = get_session_context(session_id)
+        # 🚀 P0 优化：上下文提取改为后台执行，不阻塞主请求
+        # 首次请求使用空上下文，后台提取完成后下次请求生效
+        logger.info(f"[{session_id}] 🔄 后台触发上下文提取（用户消息数: {user_message_count}，工作目录: {working_dir or 'unknown'}）")
+
+        # 定义后台更新任务
+        async def update_context_background():
+            try:
+                context_result = await extract_project_context(messages, session_id)
+                if context_result:
+                    update_session_context(session_id, context_result, user_message_count, working_dir)
+                    logger.info(f"[{session_id}] ✅ 后台上下文提取完成")
+            except Exception as e:
+                logger.error(f"[{session_id}] ❌ 后台上下文提取失败: {e}")
+
+        # 调度后台任务（非阻塞）
+        schedule_background_task(update_context_background(), f"context_enhance_{session_id[:8]}")
+
+        # 使用现有缓存的上下文（可能为空）
+        context = session_context["content"]
     else:
         context = session_context["content"]
 
@@ -1009,6 +1320,125 @@ async def call_kiro_for_summary(prompt: str) -> str:
         logger.warning(f"摘要生成失败: {e}")
 
     return ""
+
+
+async def generate_summary_background(
+    session_id: str,
+    messages: list[dict],
+    user_content: str,
+    manager: HistoryManager,
+):
+    """后台生成摘要并缓存
+
+    这个函数在后台运行，不阻塞主请求流程。
+    生成的摘要会被缓存，供下次请求使用。
+
+    Args:
+        session_id: 会话 ID
+        messages: 原始消息列表
+        user_content: 用户内容
+        manager: HistoryManager 实例
+    """
+    lock = get_summary_lock(session_id)
+
+    # 尝试获取锁，如果已有任务在生成则跳过
+    if lock.locked():
+        logger.info(f"[{session_id}] 摘要生成已在进行中，跳过")
+        return
+
+    async with lock:
+        try:
+            start_time = time.time()
+            logger.info(f"[{session_id}] 🔄 后台开始生成摘要...")
+
+            # 调用 pre_process_async 生成摘要
+            processed_messages = await manager.pre_process_async(
+                messages, user_content, call_kiro_for_summary
+            )
+
+            # 提取摘要内容（第一条 system 消息）
+            summary_content = ""
+            for msg in processed_messages:
+                if msg.get("role") == "system":
+                    content = msg.get("content", "")
+                    if isinstance(content, str) and "对话历史摘要" in content:
+                        summary_content = content
+                        break
+
+            if summary_content:
+                # 缓存摘要
+                cache_version = _summary_cache.get(session_id, {}).get("version", 0) + 1
+                _summary_cache[session_id] = {
+                    "summary": summary_content,
+                    "processed_messages": processed_messages,
+                    "version": cache_version,
+                    "timestamp": time.time(),
+                    "message_count": len(messages),
+                }
+
+                elapsed = time.time() - start_time
+                logger.info(f"[{session_id}] ✅ 后台摘要生成完成: {len(summary_content)} chars, 耗时 {elapsed:.2f}s")
+            else:
+                logger.warning(f"[{session_id}] 后台摘要生成未产生有效内容")
+
+        except Exception as e:
+            logger.error(f"[{session_id}] 后台摘要生成异常: {e}")
+
+
+def get_cached_summary(session_id: str, current_message_count: int) -> dict | None:
+    """获取缓存的摘要
+
+    Args:
+        session_id: 会话 ID
+        current_message_count: 当前消息数量
+
+    Returns:
+        缓存的摘要信息，如果缓存有效；否则返回 None
+    """
+    cached = _summary_cache.get(session_id)
+    if not cached:
+        return None
+
+    # 检查缓存是否过期（消息数量差异过大）
+    cached_msg_count = cached.get("message_count", 0)
+    if current_message_count - cached_msg_count > 10:
+        # 消息增加超过 10 条，缓存可能过时
+        logger.info(f"[{session_id}] 摘要缓存过期: {cached_msg_count} -> {current_message_count}")
+        return None
+
+    # 检查缓存时间（超过 30 分钟过期）
+    cache_age = time.time() - cached.get("timestamp", 0)
+    if cache_age > 1800:
+        logger.info(f"[{session_id}] 摘要缓存超时: {cache_age:.0f}s")
+        return None
+
+    return cached
+
+
+async def extract_context_background(session_id: str, messages: list[dict], working_dir: str):
+    """后台提取项目上下文
+
+    Args:
+        session_id: 会话 ID
+        messages: 消息列表
+        working_dir: 工作目录
+    """
+    try:
+        start_time = time.time()
+        logger.info(f"[{session_id}] 🔄 后台开始提取上下文...")
+
+        context = await extract_project_context(messages, session_id)
+        if context:
+            user_message_count = count_user_messages(messages)
+            update_session_context(session_id, context, user_message_count, working_dir)
+
+            elapsed = time.time() - start_time
+            logger.info(f"[{session_id}] ✅ 后台上下文提取完成: {len(context)} chars, 耗时 {elapsed:.2f}s")
+        else:
+            logger.info(f"[{session_id}] 后台上下文提取未产生内容")
+
+    except Exception as e:
+        logger.error(f"[{session_id}] 后台上下文提取异常: {e}")
 
 
 # ==================== Token 计数 ====================
@@ -1960,6 +2390,48 @@ def iter_text_chunks(text: str, chunk_size: int):
         yield text[i:i + chunk_size]
 
 
+def truncate_blocks_for_cli(blocks: list, max_chars: int) -> list:
+    """截断 blocks 以适应 CLI 限制
+
+    策略：
+    1. 优先保留 tool_use blocks（工具调用是核心功能）
+    2. 分配剩余空间给 text/thinking blocks
+    3. 超长文本添加截断标记
+    """
+    result = []
+    remaining = max_chars
+
+    # 分离不同类型的 blocks
+    tool_blocks = [b for b in blocks if b.get("type") == "tool_use"]
+    other_blocks = [b for b in blocks if b.get("type") != "tool_use"]
+
+    # 计算 tool_use 需要的空间并添加
+    for tb in tool_blocks:
+        tool_json = json.dumps(tb.get("input", {}))
+        remaining -= len(tool_json) + 100  # 额外空间用于元数据
+        result.append(tb)
+
+    # 分配剩余空间给其他 blocks
+    for block in other_blocks:
+        block_type = block.get("type", "text")
+        text = block.get("text", "") or block.get("thinking", "")
+
+        if len(text) <= remaining:
+            result.append(block)
+            remaining -= len(text)
+        elif remaining > 100:
+            # 截断文本并添加标记
+            truncated = text[:remaining - 50] + "\n[... 输出已截断 ...]"
+            if block_type == "thinking":
+                result.append({**block, "thinking": truncated})
+            else:
+                result.append({**block, "text": truncated})
+            remaining = 0
+        # 如果剩余空间不足，跳过该 block
+
+    return result
+
+
 def split_thinking_blocks(text: str) -> list[dict]:
     """将文本按 <thinking> 标签拆分为 text/thinking blocks"""
     import re
@@ -2155,9 +2627,12 @@ def parse_inline_tool_blocks(text: str) -> list[dict]:
                 # 标记包括：下一个工具调用、工具结果、或者文本结尾（使用预编译正则）
                 next_marker = _RE_NEXT_MARKER.search(after_match[input_match.end():])
                 if next_marker:
-                    raw_text = after_match[input_match.end():input_match.end() + next_marker.start()].strip()
+                    raw_slice = after_match[input_match.end():input_match.end() + next_marker.start()]
                 else:
-                    raw_text = after_match[input_match.end():].strip()
+                    raw_slice = after_match[input_match.end():]
+
+                raw_slice_len = len(raw_slice)  # 保存原始长度用于位置计算
+                raw_text = raw_slice.strip()     # strip 后用于 JSON 解析
 
                 # 尝试再次解析这个片段
                 try:
@@ -2168,7 +2643,7 @@ def parse_inline_tool_blocks(text: str) -> list[dict]:
                         "name": tool_name,
                         "input": input_json,
                     })
-                    last_end = match_end + input_match.end() + len(raw_text)
+                    last_end = match_end + input_match.end() + raw_slice_len  # 使用原始长度
                     pos = last_end
                     continue
                 except Exception as e:
@@ -2179,7 +2654,7 @@ def parse_inline_tool_blocks(text: str) -> list[dict]:
                         "name": tool_name,
                         "input": {"_raw": raw_text[:2000], "_parse_error": str(e)},
                     })
-                    last_end = match_end + input_match.end() + len(raw_text)
+                    last_end = match_end + input_match.end() + raw_slice_len  # 使用原始长度
                     pos = last_end
                     continue
 
@@ -2334,6 +2809,53 @@ def validate_continuation_text(truncated_text: str, request_id: str) -> tuple[bo
     return True, "有效"
 
 
+def clean_tool_markers_for_continuation(text: str) -> str:
+    """清理续传消息中的工具标记
+
+    目的：防止上游 AI 在续传时混淆这些标记
+    将工具调用标记转换为描述性文本
+    """
+    # 将工具调用标记转换为描述性文本
+    text = re.sub(
+        r'\[Calling tool:\s*([^\]]+)\]',
+        r'(调用工具: \1)',
+        text
+    )
+    text = text.replace('[Tool Result]', '(工具结果)')
+    text = text.replace('[Tool Error]', '(工具错误)')
+    return text
+
+
+# 用于匹配完整的 [Tool Result] 块（包括后续内容直到下一个标记或结尾）
+_RE_TOOL_RESULT_BLOCK = re.compile(
+    r'●?\s*\[Tool (?:Result|Error)\][\s\S]*?(?=(?:\[Calling tool:|●?\s*\[Tool (?:Result|Error)\]|$))',
+    re.MULTILINE
+)
+
+
+def clean_tool_results_from_response(text: str) -> str:
+    """从响应文本中移除 [Tool Result] 块
+
+    当模型在响应中引用或重复之前的工具结果时，
+    这些内容会被 Claude Code CLI 错误地渲染。
+    此函数移除这些不应该出现在响应中的内容。
+    """
+    if not text:
+        return text
+
+    # 移除完整的 [Tool Result] 块
+    cleaned = _RE_TOOL_RESULT_BLOCK.sub('', text)
+
+    # 移除可能残留的单独标记
+    cleaned = re.sub(r'●?\s*\[Tool Result\]\s*', '', cleaned)
+    cleaned = re.sub(r'●?\s*\[Tool Error\]\s*', '', cleaned)
+
+    # 清理多余的空行
+    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+
+    return cleaned.strip()
+
+
 def build_continuation_request(
     original_messages: list,
     truncated_text: str,
@@ -2375,10 +2897,11 @@ def build_continuation_request(
     # 构建新的消息列表
     new_messages = list(original_messages)  # 复制原始消息
 
-    # 添加截断的 assistant 响应
+    # 添加截断的 assistant 响应（清理工具标记）
+    cleaned_text = clean_tool_markers_for_continuation(truncated_text)
     new_messages.append({
         "role": "assistant",
-        "content": truncated_text
+        "content": cleaned_text
     })
 
     # 添加续传提示
@@ -2491,20 +3014,6 @@ async def fetch_with_continuation(
             accumulated_text = text
         else:
             accumulated_text = merge_responses(accumulated_text, text, request_id)
-
-        # ==================== 幻觉检测 ====================
-        # 检测 AI 是否生成了虚假的工具结果
-        has_hallucination, cleaned_text, hallucination_reason = detect_hallucinated_tool_result(
-            accumulated_text, request_id
-        )
-        if has_hallucination:
-            logger.warning(f"[{request_id}] 检测到幻觉，清理后继续: {hallucination_reason}")
-            accumulated_text = cleaned_text
-            # 幻觉通常意味着模型在等待工具结果时产生了错误输出
-            # 清理后应该停止续传，让系统正常处理工具调用
-            final_finish_reason = "end_turn"
-            final_stream_completed = True
-            break
 
         if tool_calls:
             aggregated_tool_calls.extend(tool_calls)
@@ -2818,12 +3327,18 @@ def convert_openai_to_anthropic(openai_response: dict, model: str, request_id: s
     stop_reason = "end_turn"
 
     if content:
+        # 先清理响应中可能存在的 [Tool Result] 块
+        # 这些是模型引用历史消息时可能带入的内容，不应该出现在响应中
+        content = clean_tool_results_from_response(content)
+
         # 检测并解析内联的工具调用（保序）
         blocks = parse_inline_tool_blocks(content)
         blocks = expand_thinking_blocks(blocks)
         for block in blocks:
             if block.get("type") == "text":
                 text_value = block.get("text", "")
+                # 再次清理文本块中可能残留的工具结果标记
+                text_value = clean_tool_results_from_response(text_value)
                 if text_value:
                     content_blocks.append({"type": "text", "text": text_value})
             elif block.get("type") == "thinking":
@@ -2912,12 +3427,21 @@ async def anthropic_messages(request: Request):
             logger.info(f"[{request_id}] ✅ 保留 Opus: {route_reason}")
 
     # ==================== 上下文增强 ====================
+    # 从请求头获取工作目录（Claude Code 会发送此头）
+    working_dir = request.headers.get("X-Working-Directory", "")
+    if working_dir:
+        logger.debug(f"[{request_id}] 📂 工作目录: {working_dir}")
+
+    # 获取客户端标识（用于多终端隔离）
+    client_ip = request.client.host if request.client else ""
+    client_port = request.client.port if request.client else 0
+
     # 在历史管理前增强用户消息
     messages = body.get("messages", [])
-    session_id = generate_session_id(messages)
+    session_id = generate_session_id(messages, working_dir, client_ip, client_port)
 
     # 增强最后一条用户消息（注入项目上下文）
-    messages = await enhance_user_message(messages, session_id)
+    messages = await enhance_user_message(messages, session_id, working_dir)
     body["messages"] = messages
 
     # ==================== 历史消息管理 ====================
@@ -2936,19 +3460,36 @@ async def anthropic_messages(request: Request):
     logger.info(f"[{request_id}] 需要摘要: {should_summarize}, 阈值: {HISTORY_CONFIG.summary_threshold}")
 
     if should_summarize:
-        logger.info(f"[{request_id}] 触发智能摘要...")
-        processed_messages = await manager.pre_process_async(
-            messages, user_content, call_kiro_for_summary
-        )
+        # 🚀 优化：优先使用缓存的摘要，避免阻塞
+        cached = get_cached_summary(session_id, len(messages))
 
-        # 与智能摘要集成：摘要时同步更新上下文
+        if cached:
+            # 使用缓存的摘要（零延迟）
+            processed_messages = cached.get("processed_messages", [])
+            logger.info(f"[{request_id}] ⚡ 使用缓存摘要 (version={cached.get('version')})")
+
+            # 后台更新摘要（为下次请求准备更新的版本）
+            schedule_background_task(
+                generate_summary_background(session_id, messages, user_content, manager),
+                f"summary_{session_id[:8]}"
+            )
+        else:
+            # 没有缓存，使用简单截断（不阻塞），后台生成摘要
+            logger.info(f"[{request_id}] 📝 无缓存摘要，使用简单截断，后台生成摘要...")
+            processed_messages = manager.pre_process(messages, user_content)
+
+            # 启动后台摘要生成任务
+            schedule_background_task(
+                generate_summary_background(session_id, messages, user_content, manager),
+                f"summary_{session_id[:8]}"
+            )
+
+        # 后台更新上下文（不阻塞）
         if CONTEXT_ENHANCEMENT_CONFIG["integrate_with_summary"]:
-            logger.info(f"[{request_id}] 🔄 摘要触发，同步更新项目上下文...")
-            context = await extract_project_context(messages, session_id)
-            if context:
-                user_message_count = count_user_messages(messages)
-                update_session_context(session_id, context, user_message_count)
-                logger.info(f"[{request_id}] ✅ 项目上下文已更新")
+            schedule_background_task(
+                extract_context_background(session_id, messages, working_dir),
+                f"context_{session_id[:8]}"
+            )
     else:
         processed_messages = manager.pre_process(messages, user_content)
 
@@ -3084,6 +3625,10 @@ async def handle_anthropic_stream_via_openai(
             # 检测最终响应是否仍有截断（接续后仍可能有问题）
             truncation_info = detect_truncation(full_text, stream_completed, finish_reason, request_id)
 
+            # 先清理响应中可能存在的 [Tool Result] 块
+            # 这些是模型引用历史消息时可能带入的内容，不应该出现在响应中
+            full_text = clean_tool_results_from_response(full_text)
+
             # 解析内联工具调用（保序）
             blocks = parse_inline_tool_blocks(full_text)
             tool_call_blocks = tool_calls_to_blocks(tool_calls or [])
@@ -3118,6 +3663,16 @@ async def handle_anthropic_stream_via_openai(
                     # 即使响应被截断，也让续传机制处理，不要触发 CLI 错误提示
                     pass
 
+            # 检查并截断超长输出（CLI 兼容性）
+            total_chars = sum(
+                len(b.get("text", "") or b.get("thinking", "")) +
+                (len(json.dumps(b.get("input", {}))) if b.get("type") == "tool_use" else 0)
+                for b in blocks
+            )
+            if total_chars > MAX_CLI_OUTPUT_CHARS:
+                logger.warning(f"[{request_id}] ⚠️ 输出超过 CLI 限制: {total_chars} > {MAX_CLI_OUTPUT_CHARS}")
+                blocks = truncate_blocks_for_cli(blocks, MAX_CLI_OUTPUT_CHARS)
+
             # 发送 content blocks（保序）
             block_index = 0
             emitted_block = False
@@ -3125,6 +3680,8 @@ async def handle_anthropic_stream_via_openai(
             for block in blocks:
                 if block.get("type") == "text":
                     text_value = block.get("text", "")
+                    # 再次清理可能残留的工具结果标记
+                    text_value = clean_tool_results_from_response(text_value)
                     if not text_value:
                         continue
                     emitted_block = True
@@ -3322,9 +3879,18 @@ async def chat_completions(request: Request):
     logger.info(f"[{request_id}] Request: model={model}, messages={len(messages)}, stream={stream}")
 
     # ==================== 上下文增强 ====================
+    # 从请求头获取工作目录（Claude Code 会发送此头）
+    working_dir = request.headers.get("X-Working-Directory", "")
+    if working_dir:
+        logger.debug(f"[{request_id}] 📂 工作目录: {working_dir}")
+
+    # 获取客户端标识（用于多终端隔离）
+    client_ip = request.client.host if request.client else ""
+    client_port = request.client.port if request.client else 0
+
     # 在历史管理前增强用户消息
-    session_id = generate_session_id(messages)
-    messages = await enhance_user_message(messages, session_id)
+    session_id = generate_session_id(messages, working_dir, client_ip, client_port)
+    messages = await enhance_user_message(messages, session_id, working_dir)
     body["messages"] = messages
 
     # 创建历史管理器
@@ -3332,11 +3898,32 @@ async def chat_completions(request: Request):
 
     # 预处理消息
     user_content = extract_user_content(messages)
+    should_summarize = manager.should_summarize(messages)
 
-    if manager.should_summarize(messages):
-        processed_messages = await manager.pre_process_async(
-            messages, user_content, call_kiro_for_summary
-        )
+    if should_summarize:
+        # 🚀 优化：优先使用缓存的摘要，避免阻塞
+        cached = get_cached_summary(session_id, len(messages))
+
+        if cached:
+            # 使用缓存的摘要（零延迟）
+            processed_messages = cached.get("processed_messages", [])
+            logger.info(f"[{request_id}] ⚡ 使用缓存摘要 (version={cached.get('version')})")
+
+            # 后台更新摘要
+            schedule_background_task(
+                generate_summary_background(session_id, messages, user_content, manager),
+                f"summary_{session_id[:8]}"
+            )
+        else:
+            # 没有缓存，使用简单截断，后台生成摘要
+            logger.info(f"[{request_id}] 📝 无缓存摘要，使用简单截断...")
+            processed_messages = manager.pre_process(messages, user_content)
+
+            # 启动后台摘要生成任务
+            schedule_background_task(
+                generate_summary_background(session_id, messages, user_content, manager),
+                f"summary_{session_id[:8]}"
+            )
     else:
         processed_messages = manager.pre_process(messages, user_content)
 
