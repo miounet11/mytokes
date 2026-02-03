@@ -231,7 +231,7 @@ def load_settings_from_env() -> Settings:
         "http://127.0.0.1:8000/v1/chat/completions"
     )
     settings.api.anthropic_api_key = os.getenv("ANTHROPIC_API_KEY", "")
-    settings.api.anthropic_base_url = os.getenv("ANTHROPIC_BASE_URL", "https://api.anthropic.com").rstrip("/")
+    settings.api.anthropic_base_url = os.getenv("ANTHROPIC_BASE_URL", "https://api.anthropic.com")
     settings.api.request_timeout = int(os.getenv("REQUEST_TIMEOUT", "300"))
     settings.api.connect_timeout = int(os.getenv("CONNECT_TIMEOUT", "30"))
 

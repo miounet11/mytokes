@@ -19,7 +19,7 @@ import asyncio
 import logging
 import os
 import re
-from typing import Optional, AsyncIterator
+from typing import Optional, AsyncIterator, Union
 from contextlib import asynccontextmanager
 from functools import lru_cache
 
@@ -108,8 +108,9 @@ CONTEXT_ENHANCEMENT_CONFIG = {
     # 更新策略：每 N 条用户消息更新一次
     "update_interval": int(os.getenv("CONTEXT_ENHANCEMENT_UPDATE_INTERVAL", "10")),
 
-    # 是否与智能摘要集成（推荐）
-    "integrate_with_summary": os.getenv("CONTEXT_ENHANCEMENT_INTEGRATE_SUMMARY", "true").lower() in ("1", "true", "yes"),
+    # 是否与智能摘要集成（推荐关闭以提升首字响应速度）
+    # 开启时：每次摘要后会额外调用 AI 提取项目上下文，增加 3-5s 延迟
+    "integrate_with_summary": os.getenv("CONTEXT_ENHANCEMENT_INTEGRATE_SUMMARY", "false").lower() in ("1", "true", "yes"),
 
     # 上下文提取提示词模板
     "extraction_prompt": """请分析以下对话历史，提取项目的核心上下文信息（100-200 tokens）：
@@ -162,6 +163,35 @@ HISTORY_CONFIG = HistoryConfig(
     add_warning_header=True,
 )
 
+# ==================== 异步摘要优化配置 ====================
+# 核心思想：首次请求用简单截断快速响应，后台异步生成摘要供后续使用
+ASYNC_SUMMARY_CONFIG = {
+    # 启用异步摘要模式
+    "enabled": os.getenv("ASYNC_SUMMARY_ENABLED", "true").lower() in ("1", "true", "yes"),
+
+    # 首次请求策略：当没有缓存时，使用简单截断快速响应
+    # 而非同步等待摘要生成
+    "fast_first_request": os.getenv("ASYNC_SUMMARY_FAST_FIRST", "true").lower() in ("1", "true", "yes"),
+
+    # 后台任务队列大小（防止内存泄漏）
+    "max_pending_tasks": int(os.getenv("ASYNC_SUMMARY_MAX_TASKS", "100")),
+
+    # 摘要更新间隔：每 N 条新用户消息后触发后台更新
+    "update_interval_messages": int(os.getenv("ASYNC_SUMMARY_UPDATE_INTERVAL", "5")),
+
+    # 后台任务超时（秒）
+    "task_timeout": int(os.getenv("ASYNC_SUMMARY_TASK_TIMEOUT", "30")),
+
+    # ==================== 缓存计费模拟 ====================
+    # 当缓存命中时，模拟 Anthropic prompt caching 的计费折扣
+    # 这样 NewAPI 会显示类似 "模型: 2.5 * 缓存: 0.1 * 专属倍率: 1"
+    "simulate_cache_billing": os.getenv("SIMULATE_CACHE_BILLING", "true").lower() in ("1", "true", "yes"),
+
+    # 缓存读取折扣比例（Anthropic 官方是 0.1，即 10% 价格）
+    # 我们的摘要缓存虽然不是真正的 prompt caching，但确实节省了重复计算
+    "cache_read_discount": float(os.getenv("CACHE_READ_DISCOUNT", "0.9")),
+}
+
 # 服务配置
 SERVICE_PORT = int(os.getenv("SERVICE_PORT", "8100"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "300"))
@@ -190,14 +220,23 @@ ANTHROPIC_EMPTY_ASSISTANT_PLACEHOLDER = os.getenv("ANTHROPIC_EMPTY_ASSISTANT_PLA
 TOOL_DESC_MAX_CHARS = int(os.getenv("TOOL_DESC_MAX_CHARS", "8000"))
 TOOL_PARAM_DESC_MAX_CHARS = int(os.getenv("TOOL_PARAM_DESC_MAX_CHARS", "4000"))
 
+# ==================== 原生 Tools 支持配置 ====================
+# Kiro 网关现支持原生 OpenAI tools 格式，启用后：
+# 1. 减少 token 消耗（tools 不再注入 system prompt）
+# 2. 提高解析准确性（原生 tool_calls 结构化返回）
+# 3. 支持并行工具调用
+NATIVE_TOOLS_ENABLED = os.getenv("NATIVE_TOOLS_ENABLED", "true").lower() in ("1", "true", "yes")
+# 降级开关：当原生 tools 失败时，是否回退到文本注入方式
+NATIVE_TOOLS_FALLBACK_ENABLED = os.getenv("NATIVE_TOOLS_FALLBACK_ENABLED", "true").lower() in ("1", "true", "yes")
+
 # ==================== 智能模型路由配置 ====================
 
-# 模型路由配置 - 智能判断何时使用 Opus vs Sonnet
-# 设计原则：
-# 1. Opus 用于真正需要深度推理的关键时刻（创建、设计、架构）
-# 2. Sonnet 用于执行性任务（工具调用、简单修改）
-# 3. 保证 10-20% 的 Opus 使用比例
-# 4. Extended Thinking 和 Agent 调用场景使用 Opus
+# 模型路由配置 - "Opus 大脑, Sonnet 双手" 策略
+# 核心理念：
+# 1. Opus 是大脑 - 负责规划、决策、深度分析、生成高质量上下文
+# 2. Sonnet 是双手 - 负责执行、工具调用、代码编写
+# 3. Sonnet 的弱点不是能力，而是理解深度 - 通过 Opus 生成的上下文来弥补
+# 4. 目标 Opus 使用率：15-25%（关键时刻用 Opus，其余用 Sonnet）
 MODEL_ROUTING_CONFIG = {
     # 启用智能路由
     "enabled": True,
@@ -205,6 +244,12 @@ MODEL_ROUTING_CONFIG = {
     # 目标模型映射
     "opus_model": "claude-opus-4-5-20251101",
     "sonnet_model": "claude-sonnet-4-5-20250929",
+    "haiku_model": "claude-haiku-4-5-20251001",
+
+    # ============================================================
+    # Opus 并发限制器 - 超出直接降级，无等待
+    # ============================================================
+    "opus_max_concurrent": int(os.getenv("OPUS_MAX_CONCURRENT", "200")),  # Opus 最大并发
 
     # ============================================================
     # 第零优先级：强制 Opus 的场景（不受其他条件影响）
@@ -212,75 +257,140 @@ MODEL_ROUTING_CONFIG = {
     # Extended Thinking 请求 - 必须使用 Opus
     "force_opus_on_thinking": True,
 
-    # 主 Agent 请求（非子 Agent）- 更高概率用 Opus
-    "main_agent_opus_probability": 60,  # 主 Agent 60% 概率用 Opus
+    # Plan Mode 检测 - 规划模式必须用 Opus
+    "force_opus_on_plan_mode": True,
+
+    # 主 Agent 首轮请求 - 需要 Opus 进行初始分析和规划
+    "main_agent_first_turn_opus_probability": 70,  # 主 Agent 首轮 70% 用 Opus
+
+    # 主 Agent 后续请求 - 降低概率，让 Sonnet 执行
+    "main_agent_opus_probability": 15,  # 主 Agent 后续 15% 用 Opus
 
     # ============================================================
-    # 第一优先级：强制 Opus 的关键词（最后一条用户消息包含）
-    # 这些是真正需要深度思考的任务
+    # 第一优先级：强制 Opus 的关键词（真正需要深度思考的任务）
+    # 这些是 Opus 作为"大脑"必须处理的场景
     # ============================================================
     "force_opus_keywords": [
-        # 创建类 - 完整的创建任务
-        "创建项目", "新建项目", "初始化项目", "搭建项目",
-        "create project", "new project", "init project",
-        # 设计架构类 - 需要架构思维
-        "设计架构", "系统设计", "架构设计", "方案设计", "设计",
-        "design architecture", "system design", "architecture design", "design",
-        # 深度分析类
-        "分析", "梳理", "检查问题", "全面分析", "详细分析", "根因分析", "诊断",
-        "analysis", "analyze", "diagnose", "investigate",
-        # 重构类 - 大规模重构
-        "重构", "整体重构", "大规模重构",
-        "refactor", "major refactor", "complete refactor",
-        # 规划类
-        "规划", "整体规划", "系统规划", "战略规划", "计划",
-        "plan", "planning", "strategy",
-        # Agent/Task 调用相关
-        "UI-UX", "ui-ux", "UI设计", "设计稿",
+        # === 规划和设计 ===
+        "创建项目", "新建项目", "初始化项目", "项目规划",
+        "create project", "new project", "init project", "project plan",
+        "系统设计", "架构设计", "整体架构", "技术方案",
+        "system design", "architecture design", "technical design",
+        "整体规划", "实施方案", "设计方案",
+        "implementation plan", "design plan",
+
+        # === Plan Mode 相关 ===
+        "enterplanmode", "exitplanmode", "plan mode",
+        "进入规划", "规划模式", "制定计划",
+
+        # === 复杂分析和诊断 ===
+        "全面分析", "根因分析", "深度分析", "问题诊断",
+        "root cause", "deep analysis", "comprehensive analysis",
+        "为什么会", "原因是什么", "分析一下原因",
+        "why does", "what causes", "analyze why",
+
+        # === 大规模重构 ===
+        "整体重构", "大规模重构", "系统重构", "代码重构",
+        "major refactor", "complete refactor", "system refactor",
+
+        # === 决策和评估 ===
+        "如何选择", "哪个更好", "对比分析", "优缺点",
+        "which is better", "compare", "pros and cons", "trade-off",
+        "最佳实践", "推荐方案",
+        "best practice", "recommended approach",
+
+        # === 复杂任务 ===
+        "从零开始", "完整实现", "全新功能",
+        "from scratch", "complete implementation", "new feature",
     ],
 
     # ============================================================
     # 第二优先级：强制 Sonnet 的关键词（执行性任务）
+    # Sonnet 作为"双手"高效执行这些任务
     # ============================================================
     "force_sonnet_keywords": [
-        # 简单操作
-        "看看", "显示", "列出", "打开",
-        "show", "list", "display", "view", "open",
-        # 小改动
-        "修复", "调整", "更新", "改一下", "改成",
-        "fix", "adjust", "update",
-        # 执行命令
-        "运行", "执行", "启动", "重启", "停止",
-        "run", "execute", "start", "restart", "stop",
-        # 简单问答
-        "什么是", "哪里", "是不是", "有没有",
-        "what is", "where", "is it", "do you",
-        # 读取类
-        "读取", "获取", "搜索",
-        "read", "get", "search", "find",
-        # 安装类
-        "安装", "下载",
-        "install", "download",
+        # === 简单查看操作 ===
+        "看看", "显示", "列出", "打开", "查看", "看一下",
+        "show", "list", "display", "view", "open", "check", "look at",
+
+        # === 小改动 ===
+        "修复", "调整", "更新", "改一下", "改成", "修改", "添加", "删除",
+        "fix", "adjust", "update", "modify", "add", "delete", "remove",
+        "改个", "加个", "删掉", "去掉",
+
+        # === 执行命令 ===
+        "运行", "执行", "启动", "重启", "停止", "测试", "部署",
+        "run", "execute", "start", "restart", "stop", "test", "deploy",
+
+        # === 简单问答 ===
+        "什么是", "哪里", "是不是", "有没有", "怎么用",
+        "what is", "where is", "is it", "do you", "how to use",
+
+        # === 读取/搜索类 ===
+        "读取", "获取", "搜索", "查找", "定位", "找到",
+        "read", "get", "search", "find", "locate",
+
+        # === 安装/配置类 ===
+        "安装", "下载", "配置", "设置", "环境",
+        "install", "download", "config", "setup", "environment",
+
+        # === 继续执行 ===
+        "继续", "下一步", "接着", "然后", "好的", "可以",
+        "continue", "next", "proceed", "then", "ok", "yes",
+
+        # === 工具调用相关 ===
+        "调用", "使用工具", "执行工具",
+        "call", "use tool", "execute tool",
+    ],
+
+    # ============================================================
+    # Haiku 关键词（极简任务，收紧范围）
+    # 注意：Haiku 优先级已降低，只在 Sonnet 关键词之后检测
+    # ============================================================
+    "force_haiku_keywords": [
+        # 仅保留最简单的任务
+        "翻译成", "翻译为",  # 明确的翻译请求
+        "translate to", "translate into",
     ],
 
     # ============================================================
     # 第三优先级：基于对话阶段的智能判断
+    # 核心策略：首轮用 Opus 规划，后续用 Sonnet 执行
     # ============================================================
 
-    # 首轮对话检测 - 新任务开始需要一定概率 Opus
-    "first_turn_opus_probability": 90,    # 首轮 50% 概率用 Opus
+    # 首轮对话检测 - 首轮需要 Opus 进行任务理解和规划
+    "first_turn_opus_probability": 60,    # 首轮 60% 概率用 Opus
 
     # 用户消息数阈值（不含 system）- 判断是否为首轮
-    "first_turn_max_user_messages": 2,    # <= 2 条用户消息视为首轮
+    "first_turn_max_user_messages": 2,    # ≤2 条消息视为首轮
 
-    # 工具执行阶段检测 - 大量工具调用说明在执行阶段
-    "execution_phase_tool_calls": 5,      # 工具调用 >= 5 次视为执行阶段
-    "execution_phase_sonnet_probability": 80,  # 执行阶段 90% 用 Sonnet
+    # 工具执行阶段检测 - 有工具调用说明在执行阶段，用 Sonnet
+    "execution_phase_tool_calls": 3,      # 工具调用 >= 3 次视为执行阶段
+    "execution_phase_sonnet_probability": 90,  # 执行阶段 90% 用 Sonnet
 
     # ============================================================
-    # 第四优先级：保底概率（确保 10-20% Opus 使用率）
+    # 第四优先级：保底概率
     # ============================================================
-    "base_opus_probability": 30,          # 基础 15% 概率使用 Opus
+    "base_opus_probability": 15,          # 基础 15% 概率使用 Opus
+
+    # ============================================================
+    # Sonnet 上下文增强配置
+    # 核心思想：Sonnet 的弱点是理解深度，通过注入高质量上下文来弥补
+    # ============================================================
+    "sonnet_context_enhancement": {
+        "enabled": True,
+        # 当路由到 Sonnet 时，注入 Opus 生成的摘要/上下文
+        "inject_opus_summary": True,
+        # 上下文注入的最大 token 数
+        "max_context_tokens": 2000,
+        # 上下文注入模板
+        "context_template": """<opus_analysis>
+以下是对当前任务的深度分析（由 Opus 生成）：
+{opus_context}
+</opus_analysis>
+
+请基于以上分析，高效执行用户的请求。""",
+    },
 
     # ============================================================
     # 调试和监控
@@ -331,15 +441,61 @@ _RE_FILE_PATH = re.compile(r'[/\\][\w\-\.]+\.(py|js|ts|jsx|tsx|go|rs|java|cpp|c|
 
 
 class ModelRouter:
-    """智能模型路由器 - 根据请求复杂度决定使用 Opus 还是 Sonnet"""
+    """智能模型路由器 - "Opus 大脑, Sonnet 双手" 策略
+
+    核心理念：
+    1. Opus 是大脑 - 负责规划、决策、深度分析 (15-25%)
+       - Plan Mode（规划模式）
+       - 首轮任务理解和策略制定
+       - 架构设计和复杂决策
+       - 错误诊断和根因分析
+
+    2. Sonnet 是双手 - 负责执行、工具调用、代码编写 (70-80%)
+       - 工具调用和代码执行
+       - 迭代修改和调试
+       - 简单问答和查询
+
+    3. Haiku 是快手 - 简单快速任务 (5-10%)
+       - 格式转换、翻译、简单总结
+
+    Sonnet 增强策略：
+    - Sonnet 的弱点不是能力，而是理解深度
+    - 通过注入 Opus 生成的高质量上下文来弥补
+    - 确保 Sonnet 有足够的背景信息来高效执行
+
+    并发控制：
+    - Opus 有最大并发限制，超出时自动降级到 Sonnet
+    - 确保 Opus 资源不被耗尽
+    """
 
     def __init__(self, config: dict = None):
         self.config = config or MODEL_ROUTING_CONFIG
-        self.stats = {"opus": 0, "sonnet": 0, "other": 0}
+        self.stats = {
+            "opus": 0,
+            "sonnet": 0,
+            "haiku": 0,
+            "opus_degraded": 0,
+            "opus_plan_mode": 0,      # Plan Mode 使用 Opus 的次数
+            "opus_first_turn": 0,     # 首轮使用 Opus 的次数
+            "opus_keywords": 0,       # 关键词触发 Opus 的次数
+            "sonnet_enhanced": 0,     # Sonnet 上下文增强的次数
+        }
         self._lock = asyncio.Lock()
         # 预处理关键词为小写，避免每次匹配时重复转换
         self._opus_keywords_lower = [kw.lower() for kw in self.config.get("force_opus_keywords", [])]
         self._sonnet_keywords_lower = [kw.lower() for kw in self.config.get("force_sonnet_keywords", [])]
+        self._haiku_keywords_lower = [kw.lower() for kw in self.config.get("force_haiku_keywords", [])]
+
+        # Opus 并发控制
+        self._opus_semaphore = asyncio.Semaphore(self.config.get("opus_max_concurrent", 15))
+        self._opus_current = 0
+
+        # Plan Mode 检测标记
+        self._plan_mode_markers = [
+            "enterplanmode", "exitplanmode", "plan mode",
+            "进入规划", "规划模式", "制定计划",
+            "in plan mode", "planning mode",
+        ]
 
     def _count_chars(self, messages: list, system: str = "") -> int:
         """统计总字符数"""
@@ -468,18 +624,77 @@ class ModelRouter:
                         return True
         return False
 
+    def _is_plan_mode(self, messages: list) -> bool:
+        """检测是否处于 Plan Mode（规划模式）
+
+        Plan Mode 是 Claude Code 的规划模式，需要深度思考和分析
+        """
+        # 检查 system prompt 中是否有 plan mode 标记
+        for msg in messages:
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                content_lower = content.lower()
+                for marker in self._plan_mode_markers:
+                    if marker in content_lower:
+                        return True
+            elif isinstance(content, list):
+                for item in content:
+                    if isinstance(item, dict):
+                        text = item.get("text", "") or item.get("content", "")
+                        if isinstance(text, str):
+                            text_lower = text.lower()
+                            for marker in self._plan_mode_markers:
+                                if marker in text_lower:
+                                    return True
+        return False
+
+    def _is_debugging_task(self, text: str) -> tuple[bool, str]:
+        """检测是否为调试/排查任务 - 这类任务需要 Opus 的深度分析能力
+
+        调试任务特征：
+        - 排查问题、分析错误
+        - 理解逻辑、追踪流程
+        - 诊断原因、定位 bug
+        """
+        debugging_keywords = [
+            # 排查和诊断
+            "排查", "排错", "诊断", "定位问题", "找问题",
+            "troubleshoot", "diagnose", "debug",
+            # 错误相关
+            "报错", "出错", "错误", "异常", "失败",
+            "error", "exception", "failed", "failure",
+            # 问题分析
+            "问题", "bug", "issue", "问题是",
+            # 逻辑分析
+            "逻辑", "流程", "原理", "机制",
+            "logic", "flow", "mechanism",
+            # 持续性问题
+            "还是", "依然", "仍然", "一直", "总是",
+            "still", "always", "keeps",
+            # 原因分析
+            "为什么", "原因", "怎么回事", "怎么了",
+            "why", "reason", "what happened",
+        ]
+        text_lower = text.lower()
+        for kw in debugging_keywords:
+            if kw in text_lower:
+                return True, kw
+        return False, ""
+
     def should_use_opus(self, request_body: dict) -> tuple[bool, str]:
         """
-        智能判断是否应该使用 Opus
+        智能判断是否应该使用 Opus - "Opus 大脑" 策略
 
         决策优先级：
-        0. Extended Thinking 请求 → 强制 Opus
-        0b. 主 Agent 请求 → 高概率 Opus
+        0a. Extended Thinking 请求 → 强制 Opus
+        0b. Plan Mode（规划模式）→ 强制 Opus
+        0c. 调试/排查任务 → 强制 Opus（需要深度分析）
         1. 强制 Opus 关键词 → Opus
-        2. 强制 Sonnet 关键词 → Sonnet
-        3. 首轮对话（新任务）→ 概率 Opus
+        2. 主 Agent 首轮 → 高概率 Opus（任务理解和规划）
+        3. 强制 Sonnet 关键词 → Sonnet
         4. 执行阶段（大量工具调用）→ 高概率 Sonnet
-        5. 保底概率 → 确保 ~15% Opus
+        5. 首轮对话 → 概率 Opus
+        6. 保底概率 → 确保 ~15% Opus
 
         Returns:
             (should_use_opus, reason)
@@ -489,27 +704,27 @@ class ModelRouter:
 
         messages = request_body.get("messages", [])
         last_user_msg = self._get_last_user_message(messages)
+        user_msg_count = self._count_user_messages(messages)
 
         # 生成稳定的哈希种子（相同请求得到相同结果）
         hash_seed = f"{len(messages)}:{last_user_msg[:200]}"
 
         # ============================================================
-        # 第零优先级：特殊场景强制 Opus
+        # 第零优先级：特殊场景强制 Opus（大脑必须介入）
         # ============================================================
 
         # 0a. Extended Thinking 请求 - 必须使用 Opus
         if self.config.get("force_opus_on_thinking", True) and self._has_thinking_request(request_body):
             return True, "ExtendedThinking"
 
-        # 0b. 主 Agent 请求（非子 Agent）- 更高概率用 Opus
-        is_sub_agent = self._is_sub_agent_request(messages)
-        if not is_sub_agent:
-            main_agent_prob = self.config.get("main_agent_opus_probability", 60)
-            # 只在首轮（新任务开始）时应用主 Agent 概率
-            user_msg_count = self._count_user_messages(messages)
-            if user_msg_count <= 2:
-                if self._get_hash_probability(hash_seed + ":main", main_agent_prob):
-                    return True, f"主Agent首轮({main_agent_prob}%)"
+        # 0b. Plan Mode 检测 - 规划模式必须用 Opus
+        if self.config.get("force_opus_on_plan_mode", True) and self._is_plan_mode(messages):
+            return True, "PlanMode规划"
+
+        # 0c. 调试/排查任务 - 需要 Opus 的深度分析能力
+        is_debug, debug_kw = self._is_debugging_task(last_user_msg)
+        if is_debug:
+            return True, f"调试任务[{debug_kw}]"
 
         # ============================================================
         # 第一优先级：强制 Opus 关键词（使用预处理的小写关键词）
@@ -519,29 +734,27 @@ class ModelRouter:
             return True, f"关键词[{matched_kw}]"
 
         # ============================================================
-        # 第二优先级：强制 Sonnet 关键词（使用预处理的小写关键词）
+        # 第二优先级：主 Agent 首轮请求 - 需要 Opus 进行任务理解
+        # ============================================================
+        is_sub_agent = self._is_sub_agent_request(messages)
+        if not is_sub_agent and user_msg_count <= 2:
+            # 主 Agent 首轮使用更高的 Opus 概率
+            first_turn_prob = self.config.get("main_agent_first_turn_opus_probability", 70)
+            if self._get_hash_probability(hash_seed + ":main_first", first_turn_prob):
+                return True, f"主Agent首轮({first_turn_prob}%)"
+
+        # ============================================================
+        # 第三优先级：强制 Sonnet 关键词（执行性任务）
         # ============================================================
         found, matched_kw = self._contains_keywords_optimized(last_user_msg, self._sonnet_keywords_lower)
         if found:
             return False, f"简单任务[{matched_kw}]"
 
         # ============================================================
-        # 第三优先级：对话阶段判断
+        # 第四优先级：执行阶段检测 - 有工具调用说明在执行，用 Sonnet
         # ============================================================
-        user_msg_count = self._count_user_messages(messages)
         tool_calls = self._count_tool_calls(messages)
-
-        # 3a. 首轮对话检测 - 新任务开始更需要 Opus
-        first_turn_max = self.config.get("first_turn_max_user_messages", 2)
-        if user_msg_count <= first_turn_max:
-            first_turn_prob = self.config.get("first_turn_opus_probability", 50)
-            if self._get_hash_probability(hash_seed + ":first", first_turn_prob):
-                return True, f"首轮对话({user_msg_count}条,{first_turn_prob}%)"
-            else:
-                return False, f"首轮随机Sonnet({user_msg_count}条)"
-
-        # 3b. 执行阶段检测 - 大量工具调用说明在执行，用 Sonnet
-        execution_threshold = self.config.get("execution_phase_tool_calls", 5)
+        execution_threshold = self.config.get("execution_phase_tool_calls", 3)
         if tool_calls >= execution_threshold:
             sonnet_prob = self.config.get("execution_phase_sonnet_probability", 90)
             if self._get_hash_probability(hash_seed + ":exec", sonnet_prob):
@@ -550,7 +763,16 @@ class ModelRouter:
                 return True, f"执行阶段随机Opus({tool_calls}次工具)"
 
         # ============================================================
-        # 第四优先级：保底概率
+        # 第五优先级：首轮对话检测
+        # ============================================================
+        first_turn_max = self.config.get("first_turn_max_user_messages", 2)
+        if user_msg_count <= first_turn_max:
+            first_turn_prob = self.config.get("first_turn_opus_probability", 60)
+            if self._get_hash_probability(hash_seed + ":first", first_turn_prob):
+                return True, f"首轮对话({user_msg_count}条,{first_turn_prob}%)"
+
+        # ============================================================
+        # 第六优先级：保底概率
         # ============================================================
         base_opus_prob = self.config.get("base_opus_probability", 15)
         if self._get_hash_probability(hash_seed + ":base", base_opus_prob):
@@ -558,33 +780,110 @@ class ModelRouter:
         else:
             return False, f"默认Sonnet(msg={user_msg_count},tools={tool_calls})"
 
+    def should_use_haiku(self, request_body: dict) -> tuple[bool, str]:
+        """
+        判断是否应该使用 Haiku（最快速的模型）
+
+        适用场景：
+        - 简单查询、格式转换、快速总结
+        - 不涉及代码修改或复杂推理
+
+        Returns:
+            (should_use_haiku, reason)
+        """
+        messages = request_body.get("messages", [])
+        last_user_msg = self._get_last_user_message(messages)
+
+        # 检查 Haiku 关键词
+        found, matched_kw = self._contains_keywords_optimized(last_user_msg, self._haiku_keywords_lower)
+        if found:
+            return True, f"Haiku任务[{matched_kw}]"
+
+        return False, ""
+
+    async def acquire_opus_slot(self) -> bool:
+        """
+        尝试获取 Opus 槽位
+
+        Returns:
+            True 如果成功获取，False 如果 Opus 已满
+        """
+        try:
+            # 非阻塞尝试获取
+            acquired = self._opus_semaphore.locked() is False
+            if acquired:
+                await self._opus_semaphore.acquire()
+                async with self._lock:
+                    self._opus_current += 1
+                return True
+            return False
+        except Exception:
+            return False
+
+    def release_opus_slot(self):
+        """释放 Opus 槽位"""
+        try:
+            self._opus_semaphore.release()
+            # 注意：这里不用 async with，因为可能在非异步上下文调用
+        except ValueError:
+            pass  # 已经释放过了
+
     async def route(self, request_body: dict) -> tuple[str, str]:
         """
-        路由到合适的模型（线程安全版本）
+        路由到合适的模型 - "Opus 大脑, Sonnet 双手" 策略
+
+        策略优先级：
+        1. 非 Opus 请求直接放行
+        2. 检查是否应该用 Opus（复杂任务、规划、调试）
+        3. 检查 Opus 并发限制，超出时降级到 Sonnet
+        4. 检查是否应该用 Haiku（极简任务，优先级最低）
+        5. 默认使用 Sonnet
 
         Returns:
             (routed_model, reason)
         """
         original_model = request_body.get("model", "")
 
-        # 只处理 Opus 请求
+        # 只处理 Opus 请求（Sonnet/Haiku 请求直接放行）
         if "opus" not in original_model.lower():
             async with self._lock:
-                self.stats["other"] += 1
+                if "haiku" in original_model.lower():
+                    self.stats["haiku"] += 1
+                else:
+                    self.stats["sonnet"] += 1
             return original_model, "非Opus请求"
 
+        # 检查是否应该用 Opus（优先级最高）
         should_opus, reason = self.should_use_opus(request_body)
 
-        async with self._lock:
-            if should_opus:
-                self.stats["opus"] += 1
-            else:
-                self.stats["sonnet"] += 1
-
         if should_opus:
-            return self.config.get("opus_model", "claude-opus-4-5-20251101"), reason
-        else:
-            return self.config.get("sonnet_model", "claude-sonnet-4-5-20250929"), reason
+            # 检查 Opus 并发限制
+            max_concurrent = self.config.get("opus_max_concurrent", 15)
+            async with self._lock:
+                current_opus = self.stats["opus"] - self.stats.get("opus_completed", 0)
+
+            if current_opus >= max_concurrent:
+                # Opus 已满，降级到 Sonnet
+                async with self._lock:
+                    self.stats["sonnet"] += 1
+                    self.stats["opus_degraded"] += 1
+                return self.config.get("sonnet_model"), f"Opus已满({current_opus}/{max_concurrent}),降级Sonnet"
+
+            async with self._lock:
+                self.stats["opus"] += 1
+            return self.config.get("opus_model"), reason
+
+        # Haiku 检测（优先级最低，只处理极简任务）
+        should_haiku, haiku_reason = self.should_use_haiku(request_body)
+        if should_haiku:
+            async with self._lock:
+                self.stats["haiku"] += 1
+            return self.config.get("haiku_model"), haiku_reason
+
+        # 默认使用 Sonnet
+        async with self._lock:
+            self.stats["sonnet"] += 1
+        return self.config.get("sonnet_model"), reason
 
     def route_sync(self, request_body: dict) -> tuple[str, str]:
         """
@@ -612,17 +911,24 @@ class ModelRouter:
 
     def get_stats(self) -> dict:
         """获取路由统计"""
-        total = self.stats["opus"] + self.stats["sonnet"]
+        total = self.stats["opus"] + self.stats["sonnet"] + self.stats["haiku"]
         if total == 0:
-            ratio = "N/A"
+            opus_pct = sonnet_pct = haiku_pct = 0
         else:
-            ratio = f"1:{self.stats['sonnet'] / max(self.stats['opus'], 1):.1f}"
+            opus_pct = round(self.stats["opus"] / total * 100, 1)
+            sonnet_pct = round(self.stats["sonnet"] / total * 100, 1)
+            haiku_pct = round(self.stats["haiku"] / total * 100, 1)
 
         return {
             "opus_requests": self.stats["opus"],
             "sonnet_requests": self.stats["sonnet"],
-            "other_requests": self.stats["other"],
-            "opus_sonnet_ratio": ratio,
+            "haiku_requests": self.stats["haiku"],
+            "opus_degraded": self.stats.get("opus_degraded", 0),
+            "total_requests": total,
+            "opus_percent": f"{opus_pct}%",
+            "sonnet_percent": f"{sonnet_pct}%",
+            "haiku_percent": f"{haiku_pct}%",
+            "opus_max_concurrent": self.config.get("opus_max_concurrent", 10),
         }
 
 
@@ -1009,6 +1315,208 @@ async def call_kiro_for_summary(prompt: str) -> str:
         logger.warning(f"摘要生成失败: {e}")
 
     return ""
+
+
+# ==================== 异步摘要管理器 ====================
+
+class AsyncSummaryManager:
+    """异步摘要管理器 - 后台生成摘要，不阻塞主请求
+
+    核心思想：
+    1. 首次请求：使用简单截断快速响应，后台启动摘要任务
+    2. 后续请求：使用缓存的摘要，0 延迟
+    3. 增量更新：每 N 条新消息后，后台更新摘要
+    """
+
+    def __init__(self):
+        # 摘要缓存：session_id -> {"summary": str, "message_count": int, "timestamp": float, "original_tokens": int}
+        self._summary_cache: dict[str, dict] = {}
+        # 正在进行的任务：session_id -> asyncio.Task
+        self._pending_tasks: dict[str, asyncio.Task] = {}
+        # 锁
+        self._lock = asyncio.Lock()
+        # 统计
+        self._stats = {
+            "cache_hits": 0,
+            "cache_misses": 0,
+            "async_tasks": 0,
+            "tokens_saved": 0,  # 通过缓存节省的 tokens
+        }
+
+    def get_cached_summary(self, session_id: str) -> tuple[str, bool, int]:
+        """获取缓存的摘要
+
+        Returns:
+            (summary, is_valid, original_tokens) - 摘要内容、是否有效、原始 token 数
+        """
+        cache_entry = self._summary_cache.get(session_id)
+        if cache_entry and cache_entry.get("summary"):
+            self._stats["cache_hits"] += 1
+            original_tokens = cache_entry.get("original_tokens", 0)
+            return cache_entry["summary"], True, original_tokens
+        self._stats["cache_misses"] += 1
+        return "", False, 0
+
+    def get_cache_info(self, session_id: str) -> dict:
+        """获取缓存信息，用于计费模拟
+
+        Returns:
+            {
+                "hit": bool,
+                "original_tokens": int,  # 原始消息的 token 数
+                "cached_tokens": int,    # 缓存的摘要 token 数
+                "saved_tokens": int,     # 节省的 tokens
+            }
+        """
+        cache_entry = self._summary_cache.get(session_id)
+        if cache_entry and cache_entry.get("summary"):
+            original_tokens = cache_entry.get("original_tokens", 0)
+            cached_tokens = cache_entry.get("cached_tokens", 0)
+            return {
+                "hit": True,
+                "original_tokens": original_tokens,
+                "cached_tokens": cached_tokens,
+                "saved_tokens": max(0, original_tokens - cached_tokens),
+            }
+        return {"hit": False, "original_tokens": 0, "cached_tokens": 0, "saved_tokens": 0}
+
+    def should_update_summary(self, session_id: str, current_message_count: int) -> bool:
+        """判断是否需要更新摘要
+
+        条件：
+        1. 没有缓存
+        2. 消息数增加超过阈值
+        """
+        cache_entry = self._summary_cache.get(session_id)
+        if not cache_entry:
+            return True
+
+        cached_count = cache_entry.get("message_count", 0)
+        update_interval = ASYNC_SUMMARY_CONFIG.get("update_interval_messages", 5)
+
+        return (current_message_count - cached_count) >= update_interval
+
+    def is_task_pending(self, session_id: str) -> bool:
+        """检查是否有正在进行的摘要任务"""
+        task = self._pending_tasks.get(session_id)
+        return task is not None and not task.done()
+
+    async def schedule_summary_task(
+        self,
+        session_id: str,
+        messages: list,
+        manager: "HistoryManager",
+        user_content: str
+    ):
+        """调度后台摘要任务
+
+        不阻塞主请求，后台生成摘要并更新缓存
+        """
+        if not ASYNC_SUMMARY_CONFIG.get("enabled", True):
+            return
+
+        # 检查是否已有任务在运行
+        if self.is_task_pending(session_id):
+            logger.debug(f"[{session_id[:8]}] 异步摘要任务已在运行，跳过")
+            return
+
+        # 检查队列大小
+        async with self._lock:
+            # 清理已完成的任务
+            done_sessions = [s for s, t in self._pending_tasks.items() if t.done()]
+            for s in done_sessions:
+                del self._pending_tasks[s]
+
+            if len(self._pending_tasks) >= ASYNC_SUMMARY_CONFIG.get("max_pending_tasks", 100):
+                logger.warning(f"[{session_id[:8]}] 异步摘要队列已满，跳过")
+                return
+
+            # 创建后台任务
+            task = asyncio.create_task(
+                self._generate_summary_background(session_id, messages, manager, user_content)
+            )
+            self._pending_tasks[session_id] = task
+            self._stats["async_tasks"] += 1
+
+        logger.info(f"[{session_id[:8]}] 🚀 启动后台摘要任务")
+
+    async def _generate_summary_background(
+        self,
+        session_id: str,
+        messages: list,
+        manager: "HistoryManager",
+        user_content: str
+    ):
+        """后台生成摘要任务"""
+        try:
+            timeout = ASYNC_SUMMARY_CONFIG.get("task_timeout", 30)
+
+            # 计算原始消息的 token 数（用于计费模拟）
+            original_tokens = 0
+            for msg in messages:
+                content = msg.get("content", "")
+                if isinstance(content, str):
+                    original_tokens += estimate_tokens(content)
+                elif isinstance(content, list):
+                    for item in content:
+                        if isinstance(item, dict):
+                            original_tokens += estimate_tokens(str(item.get("text", "") or item.get("content", "")))
+
+            # 使用 asyncio.wait_for 添加超时
+            processed_messages = await asyncio.wait_for(
+                manager.pre_process_async(messages, user_content, call_kiro_for_summary),
+                timeout=timeout
+            )
+
+            # 从处理后的消息中提取摘要，并计算摘要 token 数
+            summary = ""
+            cached_tokens = 0
+            for msg in processed_messages:
+                content = msg.get("content", "")
+                if isinstance(content, str):
+                    cached_tokens += estimate_tokens(content)
+                    if "[历史摘要]" in content:
+                        summary = content
+
+            if summary:
+                # 更新缓存，包含 token 信息
+                self._summary_cache[session_id] = {
+                    "summary": summary,
+                    "message_count": len(messages),
+                    "timestamp": time.time(),
+                    "processed_messages": processed_messages,
+                    "original_tokens": original_tokens,
+                    "cached_tokens": cached_tokens,
+                }
+                saved = original_tokens - cached_tokens
+                self._stats["tokens_saved"] += max(0, saved)
+                logger.info(f"[{session_id[:8]}] ✅ 后台摘要完成: {original_tokens} -> {cached_tokens} tokens (节省 {saved})")
+            else:
+                logger.debug(f"[{session_id[:8]}] 后台摘要完成，但无摘要内容")
+
+        except asyncio.TimeoutError:
+            logger.warning(f"[{session_id[:8]}] ⚠️ 后台摘要超时")
+        except Exception as e:
+            logger.error(f"[{session_id[:8]}] ❌ 后台摘要失败: {e}")
+
+    def get_cached_processed_messages(self, session_id: str) -> list | None:
+        """获取缓存的已处理消息（包含摘要）"""
+        cache_entry = self._summary_cache.get(session_id)
+        if cache_entry:
+            return cache_entry.get("processed_messages")
+        return None
+
+    def get_stats(self) -> dict:
+        """获取统计信息"""
+        return {
+            **self._stats,
+            "cache_size": len(self._summary_cache),
+            "pending_tasks": len([t for t in self._pending_tasks.values() if not t.done()]),
+        }
+
+
+# 全局异步摘要管理器实例
+async_summary_manager = AsyncSummaryManager()
 
 
 # ==================== Token 计数 ====================
@@ -1631,25 +2139,101 @@ def convert_anthropic_to_openai(anthropic_body: dict) -> dict:
     if "stop_sequences" in anthropic_body:
         openai_body["stop"] = anthropic_body["stop_sequences"]
 
-    # ==================== 工具定义注入系统提示 ====================
-    # 网关不支持 OpenAI tool_calls，将工具定义注入系统提示
-    # 模型通过 [Calling tool: xxx] 格式调用工具，响应时自动解析
+    # ==================== 工具定义处理 ====================
     anthropic_tools = anthropic_body.get("tools", [])
     if anthropic_tools:
-        tool_instruction = build_tool_instruction(anthropic_tools)
-        # 找到 system 消息并追加工具指令
-        for msg in openai_body["messages"]:
-            if msg.get("role") == "system":
-                msg["content"] = msg["content"] + "\n\n" + tool_instruction
-                break
+        if NATIVE_TOOLS_ENABLED:
+            # 原生 OpenAI tools 格式 - Kiro 网关现已支持
+            # 优势：减少 token 消耗、结构化返回、支持并行调用
+            openai_body["tools"] = convert_anthropic_tools_to_openai(anthropic_tools)
+
+            # 转换 tool_choice
+            if "tool_choice" in anthropic_body:
+                openai_tool_choice = convert_anthropic_tool_choice_to_openai(anthropic_body["tool_choice"])
+                if openai_tool_choice:
+                    openai_body["tool_choice"] = openai_tool_choice
+
+            logger.debug(f"使用原生 tools 模式，工具数量: {len(anthropic_tools)}")
         else:
-            # 没有 system 消息，创建一个
-            openai_body["messages"].insert(0, {
-                "role": "system",
-                "content": tool_instruction
-            })
+            # 降级模式：将工具定义注入系统提示
+            # 模型通过 [Calling tool: xxx] 格式调用工具，响应时自动解析
+            tool_instruction = build_tool_instruction(anthropic_tools)
+            # 找到 system 消息并追加工具指令
+            for msg in openai_body["messages"]:
+                if msg.get("role") == "system":
+                    msg["content"] = msg["content"] + "\n\n" + tool_instruction
+                    break
+            else:
+                # 没有 system 消息，创建一个
+                openai_body["messages"].insert(0, {
+                    "role": "system",
+                    "content": tool_instruction
+                })
+            logger.debug(f"使用文本注入 tools 模式，工具数量: {len(anthropic_tools)}")
 
     return openai_body
+
+
+def convert_anthropic_tools_to_openai(anthropic_tools: list) -> list:
+    """
+    将 Anthropic 格式的 tools 转换为 OpenAI 格式
+
+    Anthropic 格式:
+    {
+        "name": "tool_name",
+        "description": "...",
+        "input_schema": { "type": "object", "properties": {...} }
+    }
+
+    OpenAI 格式:
+    {
+        "type": "function",
+        "function": {
+            "name": "tool_name",
+            "description": "...",
+            "parameters": { "type": "object", "properties": {...} }
+        }
+    }
+    """
+    openai_tools = []
+    for tool in anthropic_tools:
+        openai_tool = {
+            "type": "function",
+            "function": {
+                "name": tool.get("name", ""),
+                "description": tool.get("description", ""),
+                "parameters": tool.get("input_schema", {})
+            }
+        }
+        openai_tools.append(openai_tool)
+    return openai_tools
+
+
+def convert_anthropic_tool_choice_to_openai(tool_choice) -> Optional[Union[str, dict]]:
+    """
+    将 Anthropic 格式的 tool_choice 转换为 OpenAI 格式
+
+    Anthropic 格式:
+    - {"type": "auto"} -> "auto"
+    - {"type": "any"} -> "required"
+    - {"type": "tool", "name": "xxx"} -> {"type": "function", "function": {"name": "xxx"}}
+    """
+    if not tool_choice:
+        return None
+
+    tc_type = tool_choice.get("type", "")
+
+    if tc_type == "auto":
+        return "auto"
+    elif tc_type == "any":
+        return "required"
+    elif tc_type == "tool":
+        return {
+            "type": "function",
+            "function": {"name": tool_choice.get("name", "")}
+        }
+
+    return None
 
 
 def build_tool_instruction(tools: list) -> str:
@@ -2806,7 +3390,9 @@ async def _fetch_single_stream(
 def convert_openai_to_anthropic(openai_response: dict, model: str, request_id: str) -> dict:
     """将 OpenAI 响应转换为 Anthropic 格式
 
-    关键增强：检测并转换内联的工具调用为标准 tool_use content blocks
+    支持两种工具调用格式：
+    1. 原生 tool_calls（优先）- Kiro 网关原生支持
+    2. 内联文本格式（降级）- [Calling tool: xxx] 格式
     """
     choice = openai_response.get("choices", [{}])[0]
     message = choice.get("message", {})
@@ -2817,8 +3403,32 @@ def convert_openai_to_anthropic(openai_response: dict, model: str, request_id: s
     content_blocks = []
     stop_reason = "end_turn"
 
-    if content:
-        # 检测并解析内联的工具调用（保序）
+    # 优先处理原生 tool_calls（Kiro 网关原生支持）
+    tool_calls = message.get("tool_calls", [])
+    has_native_tool_calls = bool(tool_calls)
+
+    if has_native_tool_calls:
+        # 原生 tool_calls 模式
+        logger.debug(f"[{request_id}] 检测到原生 tool_calls: {len(tool_calls)} 个")
+
+        # 先添加文本内容（如果有）
+        if content:
+            # 检查是否有 thinking 标签
+            blocks = expand_thinking_blocks([{"type": "text", "text": content}])
+            for block in blocks:
+                if block.get("type") == "text":
+                    text_value = block.get("text", "")
+                    if text_value and text_value.strip():
+                        content_blocks.append({"type": "text", "text": text_value})
+                elif block.get("type") == "thinking":
+                    content_blocks.append({"type": "thinking", "thinking": block.get("thinking", "")})
+
+        # 添加原生 tool_calls
+        content_blocks.extend(tool_calls_to_blocks(tool_calls))
+        stop_reason = "tool_use"
+
+    elif content:
+        # 降级模式：解析内联的工具调用（[Calling tool: xxx] 格式）
         blocks = parse_inline_tool_blocks(content)
         blocks = expand_thinking_blocks(blocks)
         for block in blocks:
@@ -2831,12 +3441,6 @@ def convert_openai_to_anthropic(openai_response: dict, model: str, request_id: s
             elif block.get("type") == "tool_use":
                 content_blocks.append(block)
                 stop_reason = "tool_use"
-
-    # 如果 OpenAI 返回了 tool_calls（tokens 网关可能在某些情况下返回）
-    tool_calls = message.get("tool_calls", [])
-    if tool_calls:
-        content_blocks.extend(tool_calls_to_blocks(tool_calls))
-        stop_reason = "tool_use"
 
     # 如果没有任何内容，添加空文本
     if not content_blocks:
@@ -2935,8 +3539,52 @@ async def anthropic_messages(request: Request):
     should_summarize = manager.should_summarize(messages)
     logger.info(f"[{request_id}] 需要摘要: {should_summarize}, 阈值: {HISTORY_CONFIG.summary_threshold}")
 
-    if should_summarize:
-        logger.info(f"[{request_id}] 触发智能摘要...")
+    # ==================== 异步摘要优化 ====================
+    # 核心思想：首次请求用简单截断快速响应，后台异步生成摘要供后续使用
+    cache_info = {"hit": False, "original_tokens": 0, "cached_tokens": 0, "saved_tokens": 0}
+
+    if should_summarize and ASYNC_SUMMARY_CONFIG.get("enabled", True):
+        # 检查是否有缓存的摘要
+        cached_summary, has_cache, original_tokens = async_summary_manager.get_cached_summary(session_id)
+
+        if has_cache:
+            # 获取缓存信息用于计费模拟
+            cache_info = async_summary_manager.get_cache_info(session_id)
+
+            # 使用缓存的已处理消息
+            cached_processed = async_summary_manager.get_cached_processed_messages(session_id)
+            if cached_processed:
+                logger.info(f"[{request_id}] ⚡ 使用缓存摘要，跳过同步摘要 (节省 {cache_info['saved_tokens']} tokens)")
+                processed_messages = cached_processed
+
+                # 检查是否需要后台更新摘要
+                if async_summary_manager.should_update_summary(session_id, len(messages)):
+                    await async_summary_manager.schedule_summary_task(
+                        session_id, messages, manager, user_content
+                    )
+            else:
+                # 缓存不完整，使用简单截断
+                logger.info(f"[{request_id}] ⚡ 缓存不完整，使用简单截断")
+                processed_messages = manager.pre_process(messages, user_content)
+                cache_info = {"hit": False, "original_tokens": 0, "cached_tokens": 0, "saved_tokens": 0}
+        elif ASYNC_SUMMARY_CONFIG.get("fast_first_request", True):
+            # 首次请求：使用简单截断快速响应
+            logger.info(f"[{request_id}] ⚡ 首次请求，使用简单截断（后台生成摘要）")
+            processed_messages = manager.pre_process(messages, user_content)
+
+            # 启动后台摘要任务
+            await async_summary_manager.schedule_summary_task(
+                session_id, messages, manager, user_content
+            )
+        else:
+            # 禁用快速首次请求，同步生成摘要（旧行为）
+            logger.info(f"[{request_id}] 触发同步智能摘要...")
+            processed_messages = await manager.pre_process_async(
+                messages, user_content, call_kiro_for_summary
+            )
+    elif should_summarize:
+        # 异步摘要禁用，使用同步摘要（旧行为）
+        logger.info(f"[{request_id}] 触发同步智能摘要...")
         processed_messages = await manager.pre_process_async(
             messages, user_content, call_kiro_for_summary
         )
@@ -2966,8 +3614,13 @@ async def anthropic_messages(request: Request):
     final_msg_count = len(openai_body.get("messages", []))
     total_chars = sum(len(str(m.get("content", ""))) for m in openai_body.get("messages", []))
 
+    # 记录工具模式
+    tools_count = len(openai_body.get("tools", []))
+    tools_mode = "原生" if tools_count > 0 and NATIVE_TOOLS_ENABLED else ("文本注入" if body.get("tools") else "无")
+
     logger.info(f"[{request_id}] Anthropic -> OpenAI: model={model}, stream={stream}, "
-                f"msgs={orig_msg_count}->{final_msg_count}, chars={total_chars}, max_tokens={final_max_tokens}")
+                f"msgs={orig_msg_count}->{final_msg_count}, chars={total_chars}, max_tokens={final_max_tokens}, "
+                f"tools={tools_count}({tools_mode})")
 
     # 保存调试文件（仅保留最近几个）
     debug_dir = "/tmp/ai-history-debug"
@@ -3006,9 +3659,9 @@ async def anthropic_messages(request: Request):
     }
 
     if stream:
-        return await handle_anthropic_stream_via_openai(openai_body, headers, request_id, model)
+        return await handle_anthropic_stream_via_openai(openai_body, headers, request_id, model, cache_info)
     else:
-        return await handle_anthropic_non_stream_via_openai(openai_body, headers, request_id, model)
+        return await handle_anthropic_non_stream_via_openai(openai_body, headers, request_id, model, cache_info)
 
 
 async def handle_anthropic_stream_via_openai(
@@ -3016,6 +3669,7 @@ async def handle_anthropic_stream_via_openai(
     headers: dict,
     request_id: str,
     model: str,
+    cache_info: dict = None,
 ) -> StreamingResponse:
     """处理 Anthropic 流式请求 - 通过 OpenAI 格式
 
@@ -3024,9 +3678,11 @@ async def handle_anthropic_stream_via_openai(
     2. 智能接续机制 - 当检测到截断时自动发起续传请求
     3. 高并发优化 - 使用全局 HTTP 客户端连接池
     4. Token 计数 - 支持从 OpenAI API 获取或估算 token 数量
+    5. 缓存计费模拟 - 当缓存命中时，模拟 prompt caching 折扣
 
     策略：累积完整响应后解析，检测截断并自动续传，然后正确发送 content blocks
     """
+    cache_info = cache_info or {"hit": False, "original_tokens": 0, "cached_tokens": 0, "saved_tokens": 0}
 
     # 预估输入 token 数
     estimated_input_tokens = 0
@@ -3042,9 +3698,26 @@ async def handle_anthropic_stream_via_openai(
                     estimated_input_tokens += estimate_tokens(item)
         estimated_input_tokens += 4  # 每条消息额外开销
 
+    # ==================== 缓存计费模拟 ====================
+    # 当缓存命中时，将节省的 tokens 报告为 cache_read_input_tokens
+    # 这样 NewAPI 会显示类似 "模型: 2.5 * 缓存: 0.1"
+    cache_read_tokens = 0
+    if cache_info.get("hit") and ASYNC_SUMMARY_CONFIG.get("simulate_cache_billing", True):
+        # 计算缓存读取的 tokens（节省的部分）
+        saved_tokens = cache_info.get("saved_tokens", 0)
+        if saved_tokens > 0:
+            # 将节省的 tokens 报告为 cache_read
+            # Anthropic 官方 cache_read 折扣是 0.1x
+            cache_read_tokens = saved_tokens
+            # 实际计费的 input_tokens 减少
+            estimated_input_tokens = max(0, estimated_input_tokens - saved_tokens) + cache_read_tokens
+            logger.info(f"[{request_id}] 💰 缓存计费模拟: cache_read={cache_read_tokens}, 实际input={estimated_input_tokens - cache_read_tokens}")
+
     async def generate() -> AsyncIterator[bytes]:
         try:
             # 发送 Anthropic 流式头
+            # 计算实际的 input_tokens（扣除缓存读取部分）
+            actual_input_tokens = max(0, estimated_input_tokens - cache_read_tokens)
             msg_start = {
                 "type": "message_start",
                 "message": {
@@ -3055,7 +3728,12 @@ async def handle_anthropic_stream_via_openai(
                     "model": model,
                     "stop_reason": None,
                     "stop_sequence": None,
-                    "usage": {"input_tokens": estimated_input_tokens, "output_tokens": 0, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}
+                    "usage": {
+                        "input_tokens": actual_input_tokens,
+                        "output_tokens": 0,
+                        "cache_creation_input_tokens": 0,
+                        "cache_read_input_tokens": cache_read_tokens,
+                    }
                 }
             }
             yield f"data: {json.dumps(msg_start)}\n\n".encode()
@@ -3201,8 +3879,8 @@ async def handle_anthropic_stream_via_openai(
                                f"text_len={len(full_text)}, tools={tool_count}, "
                                f"finish_reason={finish_reason}")
 
-            # message delta with token usage
-            yield f'data: {{"type":"message_delta","delta":{{"stop_reason":"{finish_reason}","stop_sequence":null}},"usage":{{"output_tokens":{output_tokens},"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}}\n\n'.encode()
+            # message delta with token usage (包含缓存信息)
+            yield f'data: {{"type":"message_delta","delta":{{"stop_reason":"{finish_reason}","stop_sequence":null}},"usage":{{"output_tokens":{output_tokens},"cache_creation_input_tokens":0,"cache_read_input_tokens":{cache_read_tokens}}}}}\n\n'.encode()
 
             # message stop
             yield f'data: {{"type":"message_stop"}}\n\n'.encode()
@@ -3246,11 +3924,15 @@ async def handle_anthropic_non_stream_via_openai(
     headers: dict,
     request_id: str,
     model: str,
+    cache_info: dict = None,
 ) -> JSONResponse:
     """处理 Anthropic 非流式请求 - 通过 OpenAI 格式
 
     高并发优化：使用全局 HTTP 客户端连接池
+    支持缓存计费模拟
     """
+    cache_info = cache_info or {"hit": False, "original_tokens": 0, "cached_tokens": 0, "saved_tokens": 0}
+
     try:
         client = get_http_client()
         response = await client.post(
@@ -3277,6 +3959,18 @@ async def handle_anthropic_non_stream_via_openai(
         # 转换 OpenAI 响应为 Anthropic 格式
         openai_response = response.json()
         anthropic_response = convert_openai_to_anthropic(openai_response, model, request_id)
+
+        # 添加缓存计费信息
+        if cache_info.get("hit") and ASYNC_SUMMARY_CONFIG.get("simulate_cache_billing", True):
+            saved_tokens = cache_info.get("saved_tokens", 0)
+            if saved_tokens > 0 and "usage" in anthropic_response:
+                original_input = anthropic_response["usage"].get("input_tokens", 0)
+                # 将节省的 tokens 作为 cache_read
+                anthropic_response["usage"]["cache_read_input_tokens"] = saved_tokens
+                # 调整实际 input_tokens
+                anthropic_response["usage"]["input_tokens"] = max(0, original_input - saved_tokens)
+                logger.info(f"[{request_id}] 💰 缓存计费模拟: cache_read={saved_tokens}")
+
         return JSONResponse(content=anthropic_response)
 
     except httpx.TimeoutException:
@@ -3354,6 +4048,15 @@ async def chat_completions(request: Request):
     for key in ["temperature", "max_tokens", "top_p", "frequency_penalty", "presence_penalty", "stop"]:
         if key in body and body[key] is not None:
             kiro_request[key] = body[key]
+
+    # ==================== 原生 Tools 支持 ====================
+    # 透传 tools 和 tool_choice 参数给 Kiro 网关
+    if NATIVE_TOOLS_ENABLED:
+        if "tools" in body and body["tools"]:
+            kiro_request["tools"] = body["tools"]
+            logger.debug(f"[{request_id}] 透传 tools 参数，工具数量: {len(body['tools'])}")
+        if "tool_choice" in body and body["tool_choice"]:
+            kiro_request["tool_choice"] = body["tool_choice"]
 
     # 添加唯一请求标识
     headers = {
@@ -3532,7 +4235,31 @@ async def get_config():
     return {
         "kiro_proxy_url": KIRO_PROXY_URL,
         "history_config": HISTORY_CONFIG.to_dict(),
+        "async_summary_config": ASYNC_SUMMARY_CONFIG,
+        "native_tools_enabled": NATIVE_TOOLS_ENABLED,
     }
+
+
+@app.get("/admin/async-summary/stats")
+async def get_async_summary_stats():
+    """获取异步摘要统计"""
+    return {
+        "config": ASYNC_SUMMARY_CONFIG,
+        "stats": async_summary_manager.get_stats(),
+    }
+
+
+@app.get("/admin/routing/stats")
+async def get_routing_stats():
+    """获取模型路由统计"""
+    return model_router.get_stats()
+
+
+@app.post("/admin/routing/reset")
+async def reset_routing_stats():
+    """重置路由统计"""
+    model_router.stats = {"opus": 0, "sonnet": 0, "haiku": 0, "opus_degraded": 0}
+    return {"status": "ok", "message": "路由统计已重置"}
 
 
 @app.post("/admin/config/history")

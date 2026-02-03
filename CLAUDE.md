@@ -7,7 +7,7 @@ This is an **AI API proxy service** that sits between Claude Code CLI and the ba
 **Key Functions:**
 1. Anthropic API format conversion (Anthropic ↔ OpenAI)
 2. Intelligent history message management (truncation/summarization)
-3. Tool call parsing and conversion
+3. Tool call parsing and conversion (**Native OpenAI tools support**)
 4. **Smart model routing** (Opus ↔ Sonnet)
 
 ---
@@ -65,9 +65,116 @@ curl http://127.0.0.1:8100/admin/routing/stats
 
 ---
 
+## Native Tools Support (NEW)
+
+Located in `api_server.py` around line 190-200.
+
+### Configuration
+
+```python
+# Enable native OpenAI tools format (recommended)
+NATIVE_TOOLS_ENABLED = True
+
+# Enable fallback to text injection when native tools fail
+NATIVE_TOOLS_FALLBACK_ENABLED = True
+```
+
+### Environment Variables
+
+```bash
+# Enable/disable native tools (default: true)
+export NATIVE_TOOLS_ENABLED=true
+
+# Enable/disable fallback (default: true)
+export NATIVE_TOOLS_FALLBACK_ENABLED=true
+```
+
+### How It Works
+
+**Native Tools Mode (Default):**
+- Tools are passed directly to Kiro gateway as OpenAI `tools` parameter
+- Kiro returns structured `tool_calls` in response
+- Benefits: Lower token usage, more accurate parsing, parallel tool calls
+
+**Fallback Mode (Legacy):**
+- Tools are injected into system prompt as text instructions
+- Model outputs `[Calling tool: xxx]` format
+- Proxy parses text to extract tool calls
+
+### Logs
+
+```
+[request_id] Anthropic -> OpenAI: model=xxx, tools=5(原生)
+[request_id] 检测到原生 tool_calls: 2 个
+```
+
+---
+
+## Async Summary Optimization (NEW)
+
+Located in `api_server.py` around line 165-190.
+
+### The Problem
+
+Previously, when messages exceeded the threshold:
+1. Synchronous summary generation: ~10s blocking
+2. Synchronous context extraction: ~3-5s blocking
+3. **Total first-token delay: ~15-17s**
+
+### The Solution
+
+**Async Summary Mode** - Non-blocking summary generation:
+
+```
+Request arrives → Check cache → Cache hit? → Use cached → Send immediately
+                              ↓
+                           Cache miss
+                              ↓
+                    Use simple truncation → Send immediately
+                              ↓
+                    Background: Generate summary → Update cache
+```
+
+### Configuration
+
+```python
+ASYNC_SUMMARY_CONFIG = {
+    "enabled": True,              # Enable async mode
+    "fast_first_request": True,   # First request uses simple truncation
+    "max_pending_tasks": 100,     # Max background tasks
+    "update_interval_messages": 5, # Update summary every N new messages
+    "task_timeout": 30,           # Background task timeout (seconds)
+}
+```
+
+### Environment Variables
+
+```bash
+export ASYNC_SUMMARY_ENABLED=true
+export ASYNC_SUMMARY_FAST_FIRST=true
+export ASYNC_SUMMARY_UPDATE_INTERVAL=5
+```
+
+### Monitor
+
+```bash
+# Check async summary stats
+curl http://127.0.0.1:8100/admin/async-summary/stats
+```
+
+### Expected Behavior
+
+| Request | Cache Status | Behavior | First-token Delay |
+|---------|--------------|----------|-------------------|
+| 1st | Miss | Simple truncation + background task | ~1-2s |
+| 2nd+ | Hit | Use cached summary | ~1-2s |
+| After N msgs | Stale | Use cache + background update | ~1-2s |
+
+---
+
 ## Smart Model Routing Configuration
 
-Located in `api_server.py` around line 120-215.
+Located in `api_server.py` around line 200-300.
 
 ### How It Works
 
