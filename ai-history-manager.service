@@ -1,0 +1,32 @@
+[Unit]
+Description=AI History Manager API Service
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=forking
+User=root
+Group=root
+WorkingDirectory=/www/wwwroot/ai-history-manager
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStart=/bin/bash /www/wwwroot/ai-history-manager/start.sh
+ExecStop=/usr/bin/pkill -9 -f "uvicorn api_server:app.*--port 8100"
+ExecReload=/bin/bash /www/wwwroot/ai-history-manager/start.sh
+PIDFile=/var/run/ai-history-manager.pid
+
+# 自动重启配置
+Restart=always
+RestartSec=10
+StartLimitInterval=300
+StartLimitBurst=5
+
+# 资源限制
+LimitNOFILE=65535
+LimitNPROC=65535
+
+# 日志
+StandardOutput=append:/var/log/ai-history-manager.log
+StandardError=append:/var/log/ai-history-manager.log
+
+[Install]
+WantedBy=multi-user.target

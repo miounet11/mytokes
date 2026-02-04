@@ -1,0 +1,52 @@
+{
+  "agents": {
+    "architect": {
+      "name": "System Architect",
+      "description": "System design, architecture decisions, and technical planning. Use for complex design tasks.",
+      "model": "opus",
+      "configFile": "agents/architect.md"
+    },
+    "performance": {
+      "name": "Performance Expert",
+      "description": "Performance analysis, optimization strategies, and bottleneck identification.",
+      "model": "opus",
+      "configFile": "agents/performance.md"
+    },
+    "security": {
+      "name": "Security Auditor",
+      "description": "Security vulnerability analysis, threat modeling, and security hardening.",
+      "model": "opus",
+      "configFile": "agents/security.md"
+    },
+    "api-design": {
+      "name": "API Designer",
+      "description": "API design, compatibility analysis, and interface optimization.",
+      "model": "opus",
+      "configFile": "agents/api-design.md"
+    },
+    "code-review": {
+      "name": "Code Reviewer",
+      "description": "Code quality analysis, best practices, and improvement suggestions.",
+      "model": "sonnet",
+      "configFile": "agents/code-review.md"
+    },
+    "testing": {
+      "name": "Testing Expert",
+      "description": "Test strategy, test case design, and coverage analysis.",
+      "model": "sonnet",
+      "configFile": "agents/testing.md"
+    },
+    "refactor": {
+      "name": "Refactoring Expert",
+      "description": "Code refactoring, technical debt reduction, and code modernization.",
+      "model": "sonnet",
+      "configFile": "agents/refactor.md"
+    },
+    "docs": {
+      "name": "Documentation Expert",
+      "description": "Documentation generation, API docs, and code comments.",
+      "model": "sonnet",
+      "configFile": "agents/docs.md"
+    }
+  }
+}

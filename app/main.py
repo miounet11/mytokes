@@ -1,3 +1,4 @@
+import re
 """AI History Manager 主应用
 
 Anthropic Messages API 兼容代理服务，支持智能模型路由和响应续传。

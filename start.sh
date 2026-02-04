@@ -6,7 +6,7 @@ set -e  # 遇到错误立即退出
 
 # ==================== 配置 ====================
 PORT=${PORT:-8100}
-WORKERS=${WORKERS:-4}
+WORKERS=${WORKERS:-32}  # 火力全开：32 workers
 LOG_FILE="/var/log/ai-history-manager.log"
 PID_FILE="/var/run/ai-history-manager.pid"
 PROJECT_DIR="/www/wwwroot/ai-history-manager"

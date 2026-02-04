@@ -1,22 +1,19 @@
-"""API 路由模块"""
-
 from fastapi import APIRouter
+from .anthropic import router as anthropic_router
+from .openai import router as openai_router
+from .admin import router as admin_router
+from .base import router as base_router
 
-from .messages import router as messages_router
-from .health import router as health_router
-from .models import router as models_router
-
-# 创建主路由
 api_router = APIRouter()
 
-# 注册子路由
-api_router.include_router(messages_router, prefix="/v1", tags=["messages"])
-api_router.include_router(models_router, prefix="/v1", tags=["models"])
-api_router.include_router(health_router, tags=["health"])
+# Anthropic 兼容端点
+api_router.include_router(anthropic_router, prefix="/v1", tags=["anthropic"])
 
-__all__ = [
-    "api_router",
-    "messages_router",
-    "health_router",
-    "models_router",
-]
+# OpenAI 兼容端点
+api_router.include_router(openai_router, prefix="/v1", tags=["openai"])
+
+# 管理端点
+api_router.include_router(admin_router, prefix="/admin", tags=["admin"])
+
+# 基础端点 (健康检查, 模型列表等)
+api_router.include_router(base_router, tags=["base"])
